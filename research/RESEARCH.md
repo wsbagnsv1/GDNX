@@ -113,8 +113,8 @@ baseline" and keep sweeping configs / trying `n_keys`+seed variations instead.
 
 ## Rules / safety
 
-- One experiment per turn. Always on `--device cuda:0` unless the log says cuda:0
-  is busy, then use cuda:1.
+- One experiment per turn on `--device cuda:1` (preferred — GPU0 drives the
+  display, so GPU1 has slightly less overhead). Use cuda:0 only if cuda:1 is busy.
 - Write ONLY under `research/`. Never delete or modify anything under
   `runs/gdn3_twotimescale_heal/`, `data/`, `gdn3/`, `train/`, or `data_pipeline/`.
 - If a run errors (`status` starts with `error:`), log it and try a *different*

@@ -113,7 +113,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--device", default="cuda:1")  # GPU0 drives the display; GPU1 has less overhead
     ap.add_argument("--no-discord", action="store_true", help="suppress the Discord result post")
     args = ap.parse_args()
     cfg = json.load(open(args.config))

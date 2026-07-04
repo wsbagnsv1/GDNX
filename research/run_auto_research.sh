@@ -26,7 +26,7 @@ while true; do
   i=$((i+1))
   echo "===== turn $i @ $(date -Is) =====" >> research/loop.log
   timeout 4200 pi -p --session-id gdn3-research --approve \
-    --provider glm --model "nvidia/GLM-5.2-NVFP4" \
+    --provider glm --model "canada-quant/GLM-5.2-W4A16-MTP" \
     --tools bash,read,write,edit \
     "$PROMPT" >> research/loop.log 2>&1
   echo "----- turn $i done rc=$? @ $(date -Is) -----" >> research/loop.log
