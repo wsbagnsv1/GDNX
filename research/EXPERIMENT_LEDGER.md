@@ -47,3 +47,17 @@ r=1 gated delta + short conv + learned decay | SVD compaction R ≳ load/4 +
 two-timescale + **STE** + **rotating transition** | optional r_out=4 / rank-r+ortho
 (efficiency only) | skip trap & data-dep RoPE | train w/ distillation or
 aux-InfoNCE, never CE-only through a frozen head.
+
+## Init-only bench (2026-07-07, 0.8B, fp32, cuda:1) — bench_gdn_memory_throughput.py
+Weights = linear-attn stack only (18 layers). State = recurrent "KV-cache" analog, bf16.
+| variant | stack weights | state total | prefill tok/s |
+|---|---|---|---|
+| native GDN | 189.8M | 10.1 MB | 6706 |
+| GDN3 original | 620.4M (3.3x; W_w+W_b gates = half) | 13.1 MB (1.29x — per-lane "3.66x savings" inverts at M=4) | 382 |
+| KMD-2 r=1 dk64 | 207.7M | 2.4 MB | 447 |
+| KMD-2 r=4 dk64 | 434.3M | 2.4 MB (r-invariant) | 437 (-2% vs r1) |
+| KMD-2 r=4 dk128 iso | 793.1M | 9.4 MB | 422 |
+Full-attn true KV cache: 12.3 MB / 1k tokens (identical all variants; dominates at 4k+).
+MIMO verdict: throughput-free in current torch impls; real bottleneck = Python scan
+loop (~15x vs native chunked path) -> kernel/chunking work is the heal's perf item.
+Decode-side MIMO claim untestable without decode caches + kernels.
