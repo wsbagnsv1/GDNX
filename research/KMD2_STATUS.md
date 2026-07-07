@@ -61,6 +61,18 @@ carryover) remains REQUIRED. => Heal design: KEEP the conv (reuse frozen Qwen
 conv1d). Optional later: a cross-carryover variant (write v_t under k_{t-1})
 as a principled in-recurrence alternative.
 
+## MAMBA-3 FINALIZATION SUITE (2026-07-07, np64, controls: r1 0.977 / ste 0.926 / r4+ortho 0.922)
+  rot (rotating state transition, data-dep cumulative 2x2): 0.957  ~neutral
+  rot+trap:                                                 0.973  ~neutral
+  r_out=4 (output-MIMO widening):                           0.984  best np64 (weak +)
+  r=4 + r_out=4 + ortho (full in+out MIMO):                 0.949  best r4; still <= r1
+  rot + STE compaction R16:                                 0.953  +2.7 over ste ctrl (~2.5σ, suggestive)
+ALL author ideas recall-SAFE; none required. Two weak positives under seed
+replication (run_seeds.sh: seeds 1,2 for ste/rot_ste/r1/rout4). Include-rationale
+should rest on primary benefits: rot -> state-tracking (+ maybe compaction
+robustness); output-MIMO -> throughput at iso-state (+1.2 downstream at 1.5B in
+Mamba-3); trap -> no benefit here (LM-ppl-scale claim untested by us), skip.
+
 ## NEXT (Qwen heal, in order)
 1. Retrofit into gdn3/kmd2.py: short conv (reuse frozen Qwen conv1d), STE across
    its compaction (if compaction is kept), slot-ortho aux term.
@@ -164,3 +176,16 @@ If KMD-2 gets recall there -> arch works when loss cooperates; if still 0 -> dee
 Alternative before editing proxy: retrain+probe whether KMD-2's q aligns to k
 (localize failure); or 1-2 sharper KMD-2 arch configs (eps 0.05) — but alignment,
 not overwrite-sharpness, is the likely crux, so arch tuning is expected to stay 0.
+
+## SEED REPLICATION (2026-07-07, n=3, np64) — FINAL ARCH DECISIONS
+  r1 baseline:      0.977/0.957/0.984  mean 0.973
+  r1 + r_out=4:     0.984/0.984/0.949  mean 0.973  -> EXACTLY recall-neutral;
+                    include only for throughput (Mamba-3 iso-state case).
+  ste R16:          0.926/0.941/0.988  mean 0.952
+  rot + ste R16:    0.953/0.965/0.988  mean 0.969  -> paired deltas +2.7/+2.3/0.0,
+                    never negative -> INCLUDE rotation (small consistent
+                    compaction-robustness bonus + state-tracking capability).
+FINAL: r=1 delta + conv + learned decay | SVD compaction R>=load/4 + STE + rot |
+optional r_out=4 / rank-r+ortho for efficiency | skip trap | train w/
+distillation or aux-InfoNCE, never CE-only-frozen. Testbed phase COMPLETE.
+Next: retrofit into the real GDN3 heal (gdn3/kmd2.py + train pipeline).
