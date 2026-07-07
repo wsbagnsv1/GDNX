@@ -70,13 +70,42 @@ class KMD2Mixer(nn.Module):
 
     def __init__(self, d, H=4, dk=32, dv=32, r=4, eps=0.5,
                  kron=False, compact_P=0, compact_R=0, slow_decay=0.97,
-                 use_conv=True, compact_ste=False):
+                 use_conv=True, compact_ste=False, trap=False,
+                 rot=False, r_out=1):
         super().__init__()
         self.H, self.dk, self.dv, self.r, self.eps = H, dk, dv, r, eps
         self.kron = kron
         self.compact_P, self.compact_R, self.slow_decay = compact_P, compact_R, slow_decay
         self.compact_ste = compact_ste
         self.use_conv = use_conv
+        # Mamba-3-style exponential-trapezoidal write (arXiv:2603.15569 Eq.5/6):
+        # write_t = lam_t * O_t + (1-lam_t) * a_t (.) O_{t-1}, lam_t data-dependent
+        # per head. Equivalent to a width-2 data-dependent conv on the state-input
+        # INSIDE the recurrence — the principled replacement for the external
+        # short conv (their 440M ablation: bias+trap obviates conv entirely).
+        # Complex/rotational state transition (Mamba-3 §complex-SSM): S evolves
+        # as S·(a_t ⊙ R_t) with data-dependent 2x2 rotation blocks. Implemented
+        # via their RoPE-trick equivalence: apply CUMULATIVE rotation Θ_t=Σθ_i
+        # to k_t and q_t, so k_j·q_t sees the relative angle Θ_t-Θ_j.
+        self.rot = rot
+        if rot:
+            self.rot_proj = nn.Linear(d, H * (dk // 2), bias=True)
+            nn.init.zeros_(self.rot_proj.weight)
+            # softplus(-4.6) ~ 0.01 rad/token at init: gentle, learnable phase
+            nn.init.constant_(self.rot_proj.bias, -4.6)
+        # Mamba-3-style output widening: r_out query slots read the state, then
+        # a learned per-head mix recombines (their C_t ∈ R^{N x R} output MIMO).
+        self.r_out = r_out
+        if r_out > 1:
+            self.out_mix = nn.Parameter(torch.full((H, r_out), 1.0 / r_out))
+        self.trap = trap
+        if trap:
+            self.lam = nn.Linear(d, H, bias=True)
+            nn.init.zeros_(self.lam.weight)
+            nn.init.zeros_(self.lam.bias)         # lam = 0.5 (classical trapezoid)
+            # Mamba-3's learnable data-independent channel biases on B/C -> our K/q
+            self.q_bias = nn.Parameter(torch.zeros(H, dk))
+            self.k_bias = nn.Parameter(torch.zeros(H, r, dk))
         if kron:
             self.m = int(math.isqrt(dk))
             assert self.m * self.m == dk, "kron needs square dk"
@@ -86,9 +115,10 @@ class KMD2Mixer(nn.Module):
             self.k2 = nn.Linear(d, H * r * self.m, bias=False)
             conv_ch = 2 * H * self.m + 2 * H * r * self.m + H * r * dv
         else:
-            self.q_proj = nn.Linear(d, H * dk, bias=False)
+            assert not (kron and r_out > 1)
+            self.q_proj = nn.Linear(d, H * r_out * dk, bias=False)
             self.k_slots = nn.Linear(d, H * r * dk, bias=False)
-            conv_ch = H * dk + H * r * dk + H * r * dv
+            conv_ch = H * r_out * dk + H * r * dk + H * r * dv
         self.v_slots = nn.Linear(d, H * r * dv, bias=False)
         self.bgate = nn.Linear(d, H * r * dk, bias=True)
         self.wgate = nn.Linear(d, H * r * dv, bias=True)
@@ -125,8 +155,13 @@ class KMD2Mixer(nn.Module):
                              k2.view(B, T, H, r, m)).reshape(B, T, H, r, dk)
         else:
             qf, kf, v = self._conv_mix([self.q_proj(x), self.k_slots(x), self.v_slots(x)])
-            q = qf.view(B, T, H, dk)
+            q = qf.view(B, T, H, self.r_out, dk)
             K = kf.view(B, T, H, r, dk)
+        if q.dim() == 4:                       # kron path: single query slot
+            q = q.unsqueeze(3)
+        if self.trap:
+            q = q + self.q_bias[:, None, :]
+            K = K + self.k_bias
         return (F.normalize(q, dim=-1, eps=1e-6),
                 F.normalize(K, dim=-1, eps=1e-6),
                 v.view(B, T, H, r, dv))
@@ -134,7 +169,17 @@ class KMD2Mixer(nn.Module):
     def forward(self, x):
         B, T, d = x.shape
         H, dk, dv, r = self.H, self.dk, self.dv, self.r
-        q, K, V = self._qkv(x, B, T)
+        q, K, V = self._qkv(x, B, T)           # q [B,T,H,r_out,dk], K [B,T,H,r,dk]
+        if self.rot:
+            # data-dependent rotating state transition via cumulative RoPE on q/k
+            theta = F.softplus(self.rot_proj(x)).view(B, T, H, dk // 2)
+            Theta = theta.cumsum(dim=1)
+            cos = Theta.cos().unsqueeze(-2)     # [B,T,H,1,dk/2]
+            sin = Theta.sin().unsqueeze(-2)
+            def rope(z):
+                z1, z2 = z[..., :dk // 2], z[..., dk // 2:]
+                return torch.cat([z1 * cos - z2 * sin, z1 * sin + z2 * cos], dim=-1)
+            q, K = rope(q), rope(K)
         # Slot-redundancy diagnostic/penalty (fable_idea §6): off-diagonal Gram
         # of the r slot keys. Stashed for the train loop to add as aux loss.
         if r > 1:
@@ -150,10 +195,15 @@ class KMD2Mixer(nn.Module):
         N = B * H
         def flat(z, *tail):
             return z.permute(1, 0, 2, *range(3, z.dim())).reshape(T, N, *tail).float()
-        q_, K_, V_ = flat(q, dk), flat(K, r, dk), flat(V, r, dv)
+        q_, K_, V_ = flat(q, self.r_out, dk), flat(K, r, dk), flat(V, r, dv)
         Bg_, Wg_, a_ = flat(Bg, r, dk), flat(Wg, r, dv), flat(a, dk)
+        if self.r_out > 1:
+            mixw = self.out_mix[None].expand(B, -1, -1).reshape(N, 1, self.r_out).float()
+        if self.trap:
+            lam_ = torch.sigmoid(self.lam(x)).permute(1, 0, 2).reshape(T, N).float()
 
         S = torch.zeros(N, dv, dk, dtype=torch.float32, device=x.device)
+        prevW = torch.zeros_like(S)
         eyeR = torch.eye(r, dtype=torch.float32, device=x.device).unsqueeze(0)
         outs = []
         for t in range(T):
@@ -164,7 +214,15 @@ class KMD2Mixer(nn.Module):
             Gram = torch.bmm(Ktil, Ktil.transpose(1, 2))
             Tt = torch.linalg.solve(eyeR * self.eps + Gram, eyeR.expand(N, r, r))
             S = S - torch.bmm(torch.bmm(SK, Tt), Ktil)
-            S = S + torch.bmm((Wg_[t] * Vt).transpose(1, 2), Kt)
+            Wt = torch.bmm((Wg_[t] * Vt).transpose(1, 2), Kt)
+            if self.trap:
+                # exponential-trapezoidal write: blend current write with the
+                # decayed previous write (carryover rides the same decay as S)
+                lam_t = lam_[t].view(N, 1, 1)
+                S = S + lam_t * Wt + (1 - lam_t) * (prevW * a_[t].unsqueeze(1))
+                prevW = Wt
+            else:
+                S = S + Wt
             if self.compact_P and (t + 1) % self.compact_P == 0:
                 # GDN3-style lossy compaction: truncate S to rank R, two-timescale
                 # blend with the old state (SVD under no_grad, like the real kernel).
@@ -182,7 +240,9 @@ class KMD2Mixer(nn.Module):
                     S = S + (S_fwd - S).detach()
                 else:
                     S = self.slow_decay * S_lr + (1 - self.slow_decay) * S
-            outs.append(torch.bmm(S, q_[t].unsqueeze(2)).squeeze(2))
+            yt = torch.bmm(S, q_[t].transpose(1, 2))            # [N, dv, r_out]
+            yt = (yt * mixw).sum(-1) if self.r_out > 1 else yt.squeeze(-1)
+            outs.append(yt)
         Y = torch.stack(outs, 0).reshape(T, B, H, dv).permute(1, 0, 2, 3)
         return self.o_proj(Y.reshape(B, T, H * dv).to(x.dtype))
 
@@ -256,6 +316,12 @@ def main():
     ap.add_argument("--compact_R", type=int, default=8, help="rank kept by compaction")
     ap.add_argument("--compact_ste", action="store_true",
                     help="straight-through gradient across compaction boundaries")
+    ap.add_argument("--trap", action="store_true",
+                    help="Mamba-3 exponential-trapezoidal write (+q/k biases)")
+    ap.add_argument("--rot", action="store_true",
+                    help="data-dependent 2x2 rotating state transition (Mamba-3 complex SSM)")
+    ap.add_argument("--r_out", type=int, default=1,
+                    help="output MIMO rank: query slots recombined per head")
     ap.add_argument("--slow_decay", type=float, default=0.97)
     ap.add_argument("--n_pairs", type=int, default=16)
     ap.add_argument("--n_query", type=int, default=4)
@@ -281,7 +347,8 @@ def main():
         mix_kw.update(dk=args.dk, dv=args.dv, r=args.r, eps=args.eps,
                       kron=args.kron, compact_P=args.compact_P,
                       compact_R=args.compact_R, slow_decay=args.slow_decay,
-                      use_conv=not args.no_conv, compact_ste=args.compact_ste)
+                      use_conv=not args.no_conv, compact_ste=args.compact_ste,
+                      trap=args.trap, rot=args.rot, r_out=args.r_out)
     model = TinyLM(vocab, d=args.d, L=args.layers, arch=args.arch, **mix_kw).to(dev)
     nparams = sum(p.numel() for p in model.parameters())
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01)

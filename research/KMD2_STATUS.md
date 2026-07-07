@@ -46,6 +46,21 @@ Info-wall law at load 64: R=16 ~93%, R=8 ~79%, R=4 ~11% -> keep R >= load/4-ish.
 Deployment note: STE changes ONLY training gradients; inference math is identical
 to the no_grad kernel, so the trained weights drop into the production kernel.
 
+## MAMBA-3 TRAPEZOIDAL TEST (2026-07-07) — trap does NOT replace the conv here
+`--trap` = Mamba-3 exp-trapezoidal write (lam_t-blended decayed prev-write
+carryover + learnable q/k channel biases; arXiv:2603.15569 Eq.5/6):
+  np16 no_conv+trap: recall 0.000     np64 no_conv+trap: recall 0.000
+  np64 conv+trap:    recall 0.945 (vs conv-only 0.977 — no stacking benefit)
+MECHANISM: the trapezoid carryover is B_{t-1}x_{t-1} — a SAME-TOKEN outer
+product (prev key (x) prev value). MQAR's key->value binding needs the CROSS
+product k_{t-1} (x) v_t (key token precedes value token), which only a shift of
+key info into the value position provides — i.e. the conv. Mamba-3's "obviates
+the conv" claim was measured on LM perplexity, not strict adjacent-token
+binding; for retrieval tasks the conv (or an explicit K-side shift/cross
+carryover) remains REQUIRED. => Heal design: KEEP the conv (reuse frozen Qwen
+conv1d). Optional later: a cross-carryover variant (write v_t under k_{t-1})
+as a principled in-recurrence alternative.
+
 ## NEXT (Qwen heal, in order)
 1. Retrofit into gdn3/kmd2.py: short conv (reuse frozen Qwen conv1d), STE across
    its compaction (if compaction is kept), slot-ortho aux term.
