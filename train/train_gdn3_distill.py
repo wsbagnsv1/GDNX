@@ -35,6 +35,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+# TF32 matmuls: ~free speedup on Ampere+ for the fp32 student; distill quality
+# is insensitive to the mantissa difference.
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 MODEL_SNAP = "/home/dev/.cache/huggingface/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17"
 
 
@@ -182,6 +187,14 @@ def main():
     ap.add_argument("--no-grad-checkpoint", action="store_true",
                     help="disable student gradient checkpointing; faster if memory fits")
     ap.add_argument("--no-discord", action="store_true")
+    ap.add_argument("--plateau-every", type=int, default=100,
+                    help="window (steps) for the plateau early-stop mean loss")
+    ap.add_argument("--plateau-eps", type=float, default=0.01,
+                    help="stop if mean loss improves < this fraction per window")
+    ap.add_argument("--plateau-patience", type=int, default=2,
+                    help="consecutive sub-eps windows required to stop")
+    ap.add_argument("--max-hours", type=float, default=0.0,
+                    help="hard wall-clock stop (0 = off); checkpoints before exiting")
     args = ap.parse_args()
 
     if args.smoke:
@@ -196,7 +209,7 @@ def main():
     sdev = torch.device(args.student_dev)
     tdev = torch.device(args.teacher_dev if torch.cuda.device_count() > 1 else args.student_dev)
 
-    dc.send(f"🚀 **GDN3 self-distillation starting**\n"
+    dc.send(f"🚀 **[{Path(args.out).name}] KMD-2 heal distillation starting**\n"
             f"steps={args.steps} seq_len={args.seq_len} bs={args.batch_size} "
             f"accum={args.grad_accum}\nLR mem={args.lr_memory} coprod={args.lr_coproduct} "
             f"preserved={args.lr_preserved} | tau={args.tau} w_kl={args.w_kl} w_ce={args.w_ce}\n"
@@ -272,6 +285,7 @@ def main():
     step = 0
     skipped = 0        # steps dropped by the NaN/inf guard (kept out of the weights)
     consec_skip = 0
+    plateau_win, prev_mean, plateau_strikes = [], None, 0
     opt.zero_grad(set_to_none=True)
 
     while step < args.steps:
@@ -330,6 +344,31 @@ def main():
                    f"skip {skipped} | mem {torch.cuda.max_memory_allocated(sdev)/1e9:.1f}G")
             dc.send(msg)
             running = {kk: 0.0 for kk in running}
+
+        # ---- plateau early-stop (mean loss per window; <eps improvement for
+        # `patience` consecutive windows => converged, stop) ----
+        plateau_win.append(micro_loss)
+        if len(plateau_win) >= args.plateau_every:
+            cur_mean = sum(plateau_win) / len(plateau_win)
+            plateau_win.clear()
+            if prev_mean is not None and prev_mean > 0:
+                improve = (prev_mean - cur_mean) / prev_mean
+                dc.send(f"📉 plateau check @ {step}: window mean {cur_mean:.4f} "
+                        f"(improve {improve*100:+.2f}%)")
+                if improve < args.plateau_eps:
+                    plateau_strikes += 1
+                    if plateau_strikes >= args.plateau_patience:
+                        dc.send(f"🏁 plateau stop @ step {step}: <{args.plateau_eps*100:.0f}% "
+                                f"improvement for {plateau_strikes} consecutive "
+                                f"{args.plateau_every}-step windows.")
+                        break
+                else:
+                    plateau_strikes = 0
+            prev_mean = cur_mean
+
+        if args.max_hours > 0 and (time.time() - t_start) / 3600 >= args.max_hours:
+            dc.send(f"⏰ wall-clock stop @ step {step} ({args.max_hours}h).")
+            break
 
         if step % args.ckpt_every == 0 and step < args.steps:
             _save(student, upgraded, out / f"step{step}", dc, step)
