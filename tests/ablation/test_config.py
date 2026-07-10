@@ -8,7 +8,7 @@ import math
 import subprocess
 import sys
 import textwrap
-from dataclasses import FrozenInstanceError, fields, is_dataclass
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
@@ -238,6 +238,202 @@ def test_task_params_reject_non_json_values_during_construction(params):
 
     with pytest.raises((TypeError, ValueError), match=r"task\.params"):
         _build(raw)
+
+
+@pytest.mark.parametrize("container_type", ["mapping", "list"])
+def test_task_config_direct_construction_rejects_json_cycles(container_type):
+    if container_type == "mapping":
+        params = {}
+        params["self"] = params
+    else:
+        cyclic_list = []
+        cyclic_list.append(cyclic_list)
+        params = {"value": cyclic_list}
+
+    with pytest.raises(ValueError, match=r"task\.params.*cycle"):
+        _config_module().TaskConfig(name="mqar", params=params)
+
+
+def test_task_config_direct_construction_enforces_json_depth_limit():
+    def nested_params(depth):
+        value = "leaf"
+        for _ in range(depth):
+            value = [value]
+        return {"value": value}
+
+    assert _config_module().TaskConfig(
+        name="mqar", params=nested_params(64)
+    ).params
+    with pytest.raises(ValueError, match=r"task\.params.*depth"):
+        _config_module().TaskConfig(name="mqar", params=nested_params(65))
+
+
+def test_task_config_direct_construction_detaches_nested_json_values():
+    module = _config_module()
+    source = [1]
+    task = module.TaskConfig(name="mqar", params={"x": source})
+    config = replace(_build(), task=task)
+    experiment_id = config.experiment_id
+
+    source.append(2)
+
+    assert config.task.params["x"] == (1,)
+    assert config.experiment_id == experiment_id
+    with pytest.raises(TypeError):
+        config.task.params["x"] = (9,)
+
+
+def test_experiment_config_direct_construction_detaches_tuple_inputs():
+    seeds = [11, 29]
+    device_preferences = ["cuda", "cpu"]
+    dtype_preferences = ["bfloat16", "float32"]
+    config = replace(
+        _build(),
+        seeds=seeds,
+        device_preferences=device_preferences,
+        dtype_preferences=dtype_preferences,
+    )
+    experiment_id = config.experiment_id
+
+    seeds.append(31)
+    device_preferences.reverse()
+    dtype_preferences.clear()
+
+    assert config.seeds == (11, 29)
+    assert config.device_preferences == ("cuda", "cpu")
+    assert config.dtype_preferences == ("bfloat16", "float32")
+    assert config.experiment_id == experiment_id
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "record_name"),
+    [
+        ("task", {"name": "mqar", "params": {}}, "TaskConfig"),
+        (
+            "protected_metrics",
+            ({"name": "validation_loss", "max_regression": 0.01},),
+            "ProtectedMetric",
+        ),
+    ],
+)
+def test_experiment_config_direct_construction_rejects_non_record_values(
+    field, value, record_name
+):
+    with pytest.raises(TypeError, match=rf"{field}.*{record_name}"):
+        replace(_build(), **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "integer_value", "float_value"),
+    [
+        ("optimizer.learning_rate", 1, 1.0),
+        ("optimizer.eps", 1, 1.0),
+        ("optimizer.weight_decay", 0, 0.0),
+        ("thresholds.min_useful_addition", 1, 1.0),
+        ("thresholds.min_reliance", 1, 1.0),
+        ("thresholds.equivalence_tolerance", 0, 0.0),
+        ("thresholds.harm_threshold", 1, 1.0),
+        ("thresholds.synergy_threshold", 0, 0.0),
+        ("promotion.min_gate_mean", 0, 0.0),
+        ("promotion.min_gate_max", 0, 0.0),
+        ("promotion.min_persistent_hit_rate", 0, 0.0),
+        ("promotion.min_conditional_read_accuracy", 0, 0.0),
+        ("promotion.min_shuffled_cache_dependence", 0, 0.0),
+        ("promotion.min_adjacent_capacity_lcb", 0, 0.0),
+        ("cache.eps_cache", 1, 1.0),
+        ("cache.lr_cache", 1, 1.0),
+        ("cache.weight_decay_cache", 0, 0.0),
+    ],
+)
+def test_declared_real_fields_canonicalize_integer_and_float_spellings(
+    field, integer_value, float_value
+):
+    integer_config = _build(_changed(field, integer_value))
+    float_config = _build(_changed(field, float_value))
+    stored_value = integer_config
+    for field_name in field.split("."):
+        stored_value = getattr(stored_value, field_name)
+
+    assert type(stored_value) is float
+    assert integer_config.canonical_json == float_config.canonical_json
+    assert integer_config.experiment_id == float_config.experiment_id
+
+
+def test_optimizer_betas_canonicalize_each_integer_and_float_spelling():
+    integer = minimal_config_dict()
+    integer["optimizer"]["betas"] = [0, 0]
+    floating = copy.deepcopy(integer)
+    floating["optimizer"]["betas"] = [0.0, 0.0]
+
+    integer_config = _build(integer)
+    float_config = _build(floating)
+
+    assert all(type(beta) is float for beta in integer_config.optimizer.betas)
+    assert integer_config.canonical_json == float_config.canonical_json
+    assert integer_config.experiment_id == float_config.experiment_id
+
+
+def test_protected_metric_real_field_canonicalizes_numeric_spellings():
+    integer = minimal_config_dict()
+    integer["protected_metrics"][0]["max_regression"] = 0
+    floating = copy.deepcopy(integer)
+    floating["protected_metrics"][0]["max_regression"] = 0.0
+
+    integer_config = _build(integer)
+    float_config = _build(floating)
+
+    assert type(integer_config.protected_metrics[0].max_regression) is float
+    assert integer_config.canonical_json == float_config.canonical_json
+    assert integer_config.experiment_id == float_config.experiment_id
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "optimizer.weight_decay",
+        "thresholds.equivalence_tolerance",
+        "thresholds.synergy_threshold",
+        "promotion.min_gate_mean",
+        "promotion.min_gate_max",
+        "promotion.min_persistent_hit_rate",
+        "promotion.min_conditional_read_accuracy",
+        "promotion.min_shuffled_cache_dependence",
+        "promotion.min_adjacent_capacity_lcb",
+        "cache.weight_decay_cache",
+    ],
+)
+def test_declared_real_fields_canonicalize_signed_zero(field):
+    negative_config = _build(_changed(field, -0.0))
+    positive_config = _build(_changed(field, 0.0))
+    stored_value = negative_config
+    for field_name in field.split("."):
+        stored_value = getattr(stored_value, field_name)
+
+    assert math.copysign(1.0, stored_value) == 1.0
+    assert negative_config.canonical_json == positive_config.canonical_json
+    assert negative_config.experiment_id == positive_config.experiment_id
+
+
+def test_optimizer_betas_and_protected_metrics_canonicalize_signed_zero():
+    negative = minimal_config_dict()
+    negative["optimizer"]["betas"][0] = -0.0
+    negative["protected_metrics"][0]["max_regression"] = -0.0
+    positive = copy.deepcopy(negative)
+    positive["optimizer"]["betas"][0] = 0.0
+    positive["protected_metrics"][0]["max_regression"] = 0.0
+
+    negative_config = _build(negative)
+    positive_config = _build(positive)
+
+    assert math.copysign(1.0, negative_config.optimizer.betas[0]) == 1.0
+    assert (
+        math.copysign(
+            1.0, negative_config.protected_metrics[0].max_regression
+        )
+        == 1.0
+    )
+    assert negative_config.canonical_json == positive_config.canonical_json
+    assert negative_config.experiment_id == positive_config.experiment_id
 
 
 def test_canonical_json_and_experiment_id_are_stable_sha256():
@@ -631,31 +827,25 @@ def test_per_metric_regression_limit_changes_experiment_identity():
     assert _build().experiment_id != _build(changed).experiment_id
 
 
-def test_every_declared_scientific_field_is_frozen_and_canonicalized():
+def test_every_declared_scientific_field_is_behaviorally_immutable_and_canonicalized():
     raw = minimal_config_dict()
     config = _build(raw)
     expected_semantics = copy.deepcopy(raw)
     expected_semantics.pop("runtime")
 
     assert config.semantic_dict() == expected_semantics
+    experiment_id = config.experiment_id
+    exported = config.semantic_dict()
+    exported["task"]["params"]["distractor_lengths"].append(999)
 
-    def assert_frozen_dataclass(instance):
-        assert is_dataclass(instance)
-        assert instance.__dataclass_params__.frozen is True
-        for dataclass_field in fields(instance):
-            value = getattr(instance, dataclass_field.name)
-            if is_dataclass(value) and not isinstance(value, type):
-                assert_frozen_dataclass(value)
-            elif isinstance(value, tuple):
-                for item in value:
-                    if is_dataclass(item) and not isinstance(item, type):
-                        assert_frozen_dataclass(item)
-
-    assert_frozen_dataclass(config)
+    assert config.task.params["distractor_lengths"] == (32, 64)
+    assert config.experiment_id == experiment_id
     with pytest.raises(TypeError):
         config.task.params["num_pairs"] = 9
     with pytest.raises(TypeError):
         config.seeds[0] = 7
+    with pytest.raises(FrozenInstanceError):
+        config.optimizer.learning_rate = 0.5
 
 
 @pytest.mark.parametrize(

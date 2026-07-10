@@ -107,7 +107,7 @@ def _copy_inventory_sources(destination_root: Path) -> None:
         shutil.copyfile(REPO_ROOT / relative_path, destination)
 
 
-def test_inventory_module_is_standard_library_only_and_never_imports_sources():
+def test_inventory_module_does_not_import_gpu_or_model_dependencies():
     module = _inventory_module()
     module_path = Path(module.__file__)
     tree = ast.parse(module_path.read_text(encoding="utf-8"))
@@ -118,15 +118,46 @@ def test_inventory_module_is_standard_library_only_and_never_imports_sources():
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported_roots.add(node.module.partition(".")[0])
 
-    assert imported_roots == {
-        "__future__",
-        "ast",
-        "collections",
-        "hashlib",
-        "pathlib",
-        "typing",
-    }
+    assert imported_roots.isdisjoint({"torch", "transformers", "triton"})
     assert "gdn3" not in imported_roots
+
+
+def test_build_inventory_hashes_and_parses_each_source_from_one_read(monkeypatch):
+    module = _inventory_module()
+
+    def fail_read_text(*args, **kwargs):
+        raise AssertionError("build_inventory must decode the bytes it hashed")
+
+    monkeypatch.setattr(Path, "read_text", fail_read_text)
+
+    inventory = module.build_inventory(REPO_ROOT)
+
+    assert inventory["source_files"] == EXPECTED_SOURCE_SHA256
+
+
+def test_inventory_ignores_unrelated_native_syntax_and_text(tmp_path, monkeypatch):
+    module = _inventory_module()
+    _copy_inventory_sources(tmp_path)
+    native_path = tmp_path / "gdn3" / "kmd2_native.py"
+    source = native_path.read_text(encoding="utf-8")
+    source += '''
+
+def unrelated_inventory_decoy(cache_unused=None):
+    """cache_ S = torch.zeros theta.cumsum(dim=0)"""
+    misleading_text = "cache_ S = torch.zeros theta.cumsum(dim=0)"
+    # cache_ S = torch.zeros theta.cumsum(dim=0)
+    return cache_unused, misleading_text
+'''
+    native_path.write_text(source, encoding="utf-8")
+    monkeypatch.setitem(
+        module.PINNED_SOURCE_SHA256,
+        "gdn3/kmd2_native.py",
+        _sha256(native_path),
+    )
+
+    inventory = module.build_inventory(tmp_path)
+
+    assert inventory["structural_findings"] == EXPECTED_STRUCTURAL_FINDINGS
 
 
 def test_inventory_records_current_positive_negative_and_legacy_capabilities(

@@ -13,6 +13,7 @@ from typing import Any
 
 SCHEMA_VERSION = "1.0.0"
 SUITE_VERSION = "1.0.0"
+_MAX_TASK_PARAMS_DEPTH = 64
 
 _BACKEND_ALIASES = {"torch_reference": "tiny", "qwen_native": "qwen"}
 _BACKENDS = {"tiny", "qwen", *_BACKEND_ALIASES}
@@ -205,6 +206,15 @@ class TaskConfig:
     name: str
     params: Mapping[str, Any]
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.params, Mapping):
+            raise TypeError("task.params must be a mapping")
+        object.__setattr__(
+            self,
+            "params",
+            _freeze_json(self.params, "task.params"),
+        )
+
 
 @dataclass(frozen=True)
 class BudgetConfig:
@@ -225,27 +235,50 @@ class OptimizerConfig:
     weight_decay: float
 
     def __post_init__(self) -> None:
-        _require_number(
-            "optimizer.learning_rate",
-            self.learning_rate,
-            minimum=0.0,
-            strict_minimum=True,
+        object.__setattr__(
+            self,
+            "learning_rate",
+            _canonical_real(
+                "optimizer.learning_rate",
+                self.learning_rate,
+                minimum=0.0,
+                strict_minimum=True,
+            ),
         )
         if type(self.betas) is not tuple or len(self.betas) != 2:
             raise TypeError("optimizer.betas must be a list or tuple of two numbers")
-        for beta in self.betas:
-            _require_number(
-                "optimizer.betas",
-                beta,
-                minimum=0.0,
-                maximum=1.0,
-                strict_maximum=True,
-            )
-        _require_number(
-            "optimizer.eps", self.eps, minimum=0.0, strict_minimum=True
+        object.__setattr__(
+            self,
+            "betas",
+            tuple(
+                _canonical_real(
+                    "optimizer.betas",
+                    beta,
+                    minimum=0.0,
+                    maximum=1.0,
+                    strict_maximum=True,
+                )
+                for beta in self.betas
+            ),
         )
-        _require_number(
-            "optimizer.weight_decay", self.weight_decay, minimum=0.0
+        object.__setattr__(
+            self,
+            "eps",
+            _canonical_real(
+                "optimizer.eps",
+                self.eps,
+                minimum=0.0,
+                strict_minimum=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "weight_decay",
+            _canonical_real(
+                "optimizer.weight_decay",
+                self.weight_decay,
+                minimum=0.0,
+            ),
         )
 
 
@@ -330,8 +363,12 @@ class ScientificThresholds:
             "harm_threshold",
             "synergy_threshold",
         ):
-            _require_number(
-                f"thresholds.{field_name}", getattr(self, field_name)
+            object.__setattr__(
+                self,
+                field_name,
+                _canonical_real(
+                    f"thresholds.{field_name}", getattr(self, field_name)
+                ),
             )
 
         if self.min_useful_addition <= 0:
@@ -361,10 +398,14 @@ class ProtectedMetric:
 
     def __post_init__(self) -> None:
         _require_string("protected_metrics.name", self.name)
-        _require_number(
-            "protected_metrics.max_regression",
-            self.max_regression,
-            minimum=0.0,
+        object.__setattr__(
+            self,
+            "max_regression",
+            _canonical_real(
+                "protected_metrics.max_regression",
+                self.max_regression,
+                minimum=0.0,
+            ),
         )
 
 
@@ -379,11 +420,15 @@ class PromotionThresholds:
 
     def __post_init__(self) -> None:
         for field in fields(self):
-            _require_number(
-                f"promotion.{field.name}",
-                getattr(self, field.name),
-                minimum=0.0,
-                maximum=1.0,
+            object.__setattr__(
+                self,
+                field.name,
+                _canonical_real(
+                    f"promotion.{field.name}",
+                    getattr(self, field.name),
+                    minimum=0.0,
+                    maximum=1.0,
+                ),
             )
 
     @property
@@ -427,7 +472,16 @@ class CacheConfig:
         _require_choice(
             "cache.read_init", self.read_init, _CACHE_READ_INITIALIZATIONS
         )
-        _require_number("cache.eps_cache", self.eps_cache, minimum=0.0, strict_minimum=True)
+        object.__setattr__(
+            self,
+            "eps_cache",
+            _canonical_real(
+                "cache.eps_cache",
+                self.eps_cache,
+                minimum=0.0,
+                strict_minimum=True,
+            ),
+        )
         _require_choice(
             "cache.coordinate_frame",
             self.coordinate_frame,
@@ -451,8 +505,21 @@ class CacheConfig:
         _require_choice(
             "cache.tie_policy", self.tie_policy, {"score_desc_position_desc"}
         )
-        _require_number("cache.lr_cache", self.lr_cache, minimum=0.0, strict_minimum=True)
-        _require_number("cache.weight_decay_cache", self.weight_decay_cache)
+        object.__setattr__(
+            self,
+            "lr_cache",
+            _canonical_real(
+                "cache.lr_cache",
+                self.lr_cache,
+                minimum=0.0,
+                strict_minimum=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "weight_decay_cache",
+            _canonical_real("cache.weight_decay_cache", self.weight_decay_cache),
+        )
         if self.weight_decay_cache != 0:
             raise ValueError("cache.weight_decay_cache must be exactly 0")
 
@@ -475,7 +542,13 @@ def _freeze(value: Any) -> Any:
     return value
 
 
-def _freeze_json(value: Any, path: str) -> Any:
+def _freeze_json(
+    value: Any,
+    path: str,
+    *,
+    _active_containers: set[int] | None = None,
+    _depth: int = 0,
+) -> Any:
     """Validate a JSON value recursively while returning frozen containers."""
     value_type = type(value)
     if value is None or value_type in (bool, int, str):
@@ -484,18 +557,44 @@ def _freeze_json(value: Any, path: str) -> Any:
         if not math.isfinite(value):
             raise ValueError(f"{path} float values must be finite")
         return value
-    if isinstance(value, Mapping):
-        frozen = {}
-        for key, item in value.items():
-            if type(key) is not str:
-                raise TypeError(f"{path} mapping keys must be strings")
-            frozen[key] = _freeze_json(item, f"{path}[{key!r}]")
-        return MappingProxyType(frozen)
-    if isinstance(value, (list, tuple)):
-        return tuple(
-            _freeze_json(item, f"{path}[{index}]")
-            for index, item in enumerate(value)
+    if isinstance(value, Mapping) or isinstance(value, (list, tuple)):
+        active_containers = (
+            set() if _active_containers is None else _active_containers
         )
+        container_id = id(value)
+        if container_id in active_containers:
+            raise ValueError(f"{path} contains a JSON cycle")
+        if _depth > _MAX_TASK_PARAMS_DEPTH:
+            raise ValueError(
+                f"{path} exceeds the maximum task.params JSON depth of "
+                f"{_MAX_TASK_PARAMS_DEPTH}"
+            )
+
+        active_containers.add(container_id)
+        try:
+            if isinstance(value, Mapping):
+                frozen = {}
+                for key, item in value.items():
+                    if type(key) is not str:
+                        raise TypeError(f"{path} mapping keys must be strings")
+                    frozen[key] = _freeze_json(
+                        item,
+                        f"{path}[{key!r}]",
+                        _active_containers=active_containers,
+                        _depth=_depth + 1,
+                    )
+                return MappingProxyType(frozen)
+            return tuple(
+                _freeze_json(
+                    item,
+                    f"{path}[{index}]",
+                    _active_containers=active_containers,
+                    _depth=_depth + 1,
+                )
+                for index, item in enumerate(value)
+            )
+        finally:
+            active_containers.remove(container_id)
     raise TypeError(
         f"{path} contains unsupported JSON value type {value_type.__name__}"
     )
@@ -569,6 +668,28 @@ def _require_number(
         if invalid:
             relation = "less than" if strict_maximum else "at most"
             raise ValueError(f"{name} must be {relation} {maximum}")
+
+
+def _canonical_real(
+    name: str,
+    value: Any,
+    *,
+    minimum: float | None = None,
+    strict_minimum: bool = False,
+    maximum: float | None = None,
+    strict_maximum: bool = False,
+) -> float:
+    """Validate and return the one canonical float spelling of a real value."""
+    _require_number(
+        name,
+        value,
+        minimum=minimum,
+        strict_minimum=strict_minimum,
+        maximum=maximum,
+        strict_maximum=strict_maximum,
+    )
+    canonical = float(value)
+    return 0.0 if canonical == 0.0 else canonical
 
 
 def _require_list(name: str, value: Any) -> list[Any]:
@@ -728,6 +849,68 @@ class ExperimentConfig:
     cache: CacheConfig
     runtime: RuntimeConfig
 
+    def __post_init__(self) -> None:
+        record_fields = (
+            ("qwen", QwenConfig),
+            ("task", TaskConfig),
+            ("budget", BudgetConfig),
+            ("optimizer", OptimizerConfig),
+            ("schedule", ScheduleConfig),
+            ("model", ModelConfig),
+            ("lengths", LengthConfig),
+            ("evaluation", EvaluationConfig),
+            ("thresholds", ScientificThresholds),
+            ("promotion", PromotionThresholds),
+            ("cache", CacheConfig),
+            ("runtime", RuntimeConfig),
+        )
+        for field_name, record_type in record_fields:
+            value = getattr(self, field_name)
+            if not isinstance(value, record_type):
+                raise TypeError(
+                    f"{field_name} must be a {record_type.__name__} record"
+                )
+
+        for field_name in (
+            "seeds",
+            "protected_metrics",
+            "device_preferences",
+            "dtype_preferences",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, (list, tuple)):
+                raise TypeError(f"{field_name} must be a list or tuple")
+            object.__setattr__(self, field_name, tuple(value))
+
+        if not self.seeds:
+            raise ValueError("seeds must not be empty")
+        for seed in self.seeds:
+            _require_int("seeds", seed)
+
+        if not self.protected_metrics:
+            raise ValueError("protected_metrics must not be empty")
+        protected_metric_names: set[str] = set()
+        for index, metric in enumerate(self.protected_metrics):
+            if not isinstance(metric, ProtectedMetric):
+                raise TypeError(
+                    f"protected_metrics[{index}] must be a ProtectedMetric record"
+                )
+            if metric.name in protected_metric_names:
+                raise ValueError(
+                    "protected_metrics contains duplicate metric name: "
+                    f"{metric.name}"
+                )
+            protected_metric_names.add(metric.name)
+
+        for preference in self.device_preferences:
+            _require_choice("device_preferences", preference, _DEVICES)
+        if not self.device_preferences:
+            raise ValueError("device_preferences must not be empty")
+        for preference in self.dtype_preferences:
+            _require_choice("dtype_preferences", preference, _DTYPES)
+        if not self.dtype_preferences:
+            raise ValueError("dtype_preferences must not be empty")
+
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "ExperimentConfig":
         """Build an immutable configuration from the complete schema mapping."""
@@ -835,7 +1018,7 @@ class ExperimentConfig:
             variant=raw["variant"],
             task=TaskConfig(
                 name=task["name"],
-                params=_freeze_json(task["params"], "task.params"),
+                params=task["params"],
             ),
             seeds=_freeze(seeds),
             budget=BudgetConfig(**budget),
