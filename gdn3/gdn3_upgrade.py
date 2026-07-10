@@ -906,8 +906,12 @@ class GDN3UpgradeManager:
 
         print(f"\nGDN3 Upgrade: Scanning {len(layer_types)} layers...")
 
+        use_kmd2_native = os.environ.get("GDN3_KMD2_NATIVE", "0") != "0"
         use_kmd2 = os.environ.get("GDN3_KMD2", "0") != "0"
-        if use_kmd2:
+        if use_kmd2_native:
+            from .kmd2_native import KMD2NativeAttn
+            print("  [KMD-2 native] warm-start at the GDN-2 point + identity-init DOF")
+        elif use_kmd2:
             from .kmd2 import KMD2LinearAttn
             print("  [KMD-2] using Fable's rank-r MIMO delta drop-in")
 
@@ -915,10 +919,13 @@ class GDN3UpgradeManager:
             if layer_type == 'linear_attention':
                 layer = self.model.model.layers[idx]
 
-                # Create replacement: KMD-2 (Fable) or original GDN3
-                gdn3_attn = (KMD2LinearAttn(self.config, layer_idx=idx)
-                             if use_kmd2 else
-                             GDN3LinearAttn(self.config, layer_idx=idx))
+                # Create replacement: KMD-2 native / KMD-2 / original GDN3
+                if use_kmd2_native:
+                    gdn3_attn = KMD2NativeAttn(self.config, layer_idx=idx)
+                elif use_kmd2:
+                    gdn3_attn = KMD2LinearAttn(self.config, layer_idx=idx)
+                else:
+                    gdn3_attn = GDN3LinearAttn(self.config, layer_idx=idx)
 
                 # Load Qwen3.5 weights (warm-start)
                 layer_state = {}

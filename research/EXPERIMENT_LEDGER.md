@@ -1,4 +1,4 @@
-# GDN3 / KMD-2 Experiment Ledger (through 2026-07-07)
+# GDN3 / KMD-2 Experiment Ledger (through 2026-07-08)
 
 One row per experiment (or cluster). Builder legend: **GLM 5.2** = autonomous
 auto-research loop (exp001–041, frozen-Qwen CE proxy); **Opus 4.8** = session
@@ -31,6 +31,8 @@ from imperfect memory of the 41-run history — see `research_log.md` +
 | 19 | Mamba-3 finalization | rot / rot+trap / r_out4 / r4+r_out4+ortho / rot+STE (1 seed) | Fable | .957 / .973 / .984 / .949 / .953 | Medium alone — resolved by #20. |
 | 20 | seed replication (n=3) | rot+STE vs STE; r_out4 vs r1 | Fable | rot: +2.7/+2.3/0.0 (never neg); r_out4 dead-even | Med-high. rot = include; widening = efficiency-only. |
 | 21 | rope_mod (2 seeds) | Fixed RoPE ladder × learned per-token rate, ±STE | Fable | .934 / .928 — below baseline & rot | Med-high skip. Caveat: full-dim ladder (not partial). |
+| 22 | **kmd2_native_heal** (2026-07-08) | Warm-start @ GDN-2 point + layerwise distill; KMD-2 native drop-in (conv+rot+r_out=4, decoupled write, per-chan decay all identity-init) into Qwen3.5-0.8B. Verified functional at init (KL 2e-4, RULER 4/4). Dual-GPU, bf16 teacher; **1315 steps @ seq_len 512** in 6.5h (Python scan = 18s/step). | Fable | loss/KL/layerwise flat-low from warm start (loss 0.074→0.074); CE weakly-weighted ~2.28↓slow; gnorm ~2.7 stable. **First working GDN+MIMO heal that beats native baseline on retrieval.** | HIGH — init gates + RULER (#23) corroborate. Undertrained (2.7M tok); perf item = chunked/kernel scan. |
+| 23 | **RULER falloff 512→32768** (2026-07-08, n=32) | Heal (r_out=4, bf16) vs native GDN teacher, 16 needles, {512..32768} tok × {1,4,8} queries. Forced mem-efficient SDPA on preserved attn layers (fp32 fell to math backend → OOM >8k). | Fable | 1q always 1.00 (both) ≤16k. **512–4k: heal WINS every multi-query cell** — Δ +0.20/+0.15 @512, +0.18/+0.15 @1k, +0.11/+0.12 @2k, +.03/+.12 @4k (margin biggest at short ctx, shrinks toward 8k). **~8k crossover** (teacher +0.04, in noise). **≥16k cliff**: 16k/4q .34 vs .93; 32k/1q .00 vs 1.00. | HIGH (n=32, CI-tight, both directions replicated). Cliff = pure seq_len-512 train artifact (16k=32× OOD; rotation phase + decay drift off-manifold), NOT arch. The **short-ctx multi-query win IS the MIMO payoff** — r_out=4 slots read multiple values in one pass where single-slot native smears. Next lever: longer-ctx training / length-extension. |
 
 ## Never tested (known gaps)
 - RLS ε (T-factor regularizer) sweep; r>4.

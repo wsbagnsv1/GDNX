@@ -104,7 +104,7 @@ MEMORY_KEYS = ("W_w", "W_b", "W_decay", "router_proj", "_agg_proj")
 COPROD_KEYS = ("W_q_a", "W_q_b", "W_k_a", "W_k_b", "W_v_a", "W_v_b",
                "coprod_mix", "coprod_strength")
 PRESERVED_KEYS = ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b",
-                  "conv1d", "norm", "out_proj")
+                  "conv1d", "norm", "out_proj", "A_log", "dt_bias")
 
 
 def classify(name: str) -> str:
@@ -197,6 +197,10 @@ def main():
                     help="hard wall-clock stop (0 = off); checkpoints before exiting")
     ap.add_argument("--resume", default="",
                     help="path to a gdn3_layers.pt checkpoint to warm-start from")
+    ap.add_argument("--w-layer", type=float, default=0.0,
+                    help="layerwise residual-stream distillation weight: per-layer "
+                         "normalized MSE between student and teacher hidden_states "
+                         "(checkpoint-safe dense signal)")
     ap.add_argument("--plateau-doubling", action="store_true",
                     help="power-law-aware plateau: windows double in length each "
                          "check, so a healthy power-law descent (constant improvement "
@@ -291,7 +295,7 @@ def main():
 
     bit = batches()
     Vsz = student.config.vocab_size
-    running = {"loss": 0.0, "kl": 0.0, "ce": 0.0}
+    running = {"loss": 0.0, "kl": 0.0, "ce": 0.0, "lw": 0.0}
     t_start = time.time()
     step = 0
     skipped = 0        # steps dropped by the NaN/inf guard (kept out of the weights)
@@ -305,20 +309,32 @@ def main():
         bad = False
         for _ in range(args.grad_accum):
             ids = next(bit).to(sdev, non_blocking=True).long()
+            want_hs = args.w_layer > 0
             with torch.no_grad():
-                t_logits = teacher(input_ids=ids.to(tdev)).logits.to(sdev)
-            s_logits = student(input_ids=ids).logits
+                t_out = teacher(input_ids=ids.to(tdev), output_hidden_states=want_hs)
+                t_logits = t_out.logits.to(sdev)
+            s_out = student(input_ids=ids, output_hidden_states=want_hs)
+            s_logits = s_out.logits
             loss, kl, ce = distill_loss(s_logits, t_logits, ids,
                                         args.w_kl, args.w_ce, args.tau)
+            if want_hs:
+                # layerwise residual-stream match: normalized MSE per boundary
+                lw = 0.0
+                for th, sh in zip(t_out.hidden_states[1:], s_out.hidden_states[1:]):
+                    th = th.to(sdev, torch.float32)
+                    lw = lw + (sh.float() - th).pow(2).mean() / th.pow(2).mean().clamp_min(1e-8)
+                lw = lw / max(1, len(t_out.hidden_states) - 1)
+                loss = loss + args.w_layer * lw
+                running["lw"] += float(lw.detach()) / args.grad_accum
             if not torch.isfinite(loss):        # forward blew up on this batch
                 bad = True
-                del t_logits, s_logits
+                del t_logits, s_logits, t_out, s_out
                 continue                         # never backward a NaN
             (loss / args.grad_accum).backward()
             micro_loss += loss.item() / args.grad_accum
             running["kl"] += kl.item() / args.grad_accum
             running["ce"] += ce.item() / args.grad_accum
-            del t_logits, s_logits
+            del t_logits, s_logits, t_out, s_out
 
         gnorm = torch.nn.utils.clip_grad_norm_(
             [p for g in groups for p in g["params"]], args.clip)
@@ -350,7 +366,8 @@ def main():
             spstep = el / step
             tps = args.seq_len * args.batch_size * args.grad_accum / max(spstep, 1e-9)
             msg = (f"step {step}/{args.steps} | loss {running['loss']/k:.4f} "
-                   f"kl {running['kl']/k:.4f} ce {running['ce']/k:.4f} | "
+                   f"kl {running['kl']/k:.4f} ce {running['ce']/k:.4f} "
+                   f"lw {running['lw']/k:.4f} | "
                    f"gnorm {gnorm:.2f} | lr_mem {cur_lrs.get('memory',0):.2e} | "
                    f"{spstep:.1f}s/step {tps:.0f} tok/s eta {eta_h:.1f}h | "
                    f"skip {skipped} | mem {torch.cuda.max_memory_allocated(sdev)/1e9:.1f}G")

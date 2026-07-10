@@ -12,6 +12,13 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 sys.path.insert(0, "/home/dev/gdn3_fable")
 
 import torch
+from torch.nn.attention import sdpa_kernel, SDPBackend
+
+# preserved full-attention layers fall back to the SDPA math backend (no flash-attn
+# lib installed), which materializes the full TxT score matrix and OOMs past ~8k on
+# a 15.5G card. Force the memory-efficient / flash kernels: O(T) memory.
+_SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION,
+                  SDPBackend.MATH]
 
 SNAP = ("/home/dev/.cache/huggingface/models--Qwen--Qwen3.5-0.8B/snapshots/"
         "2fc06364715b967f1860aea9cf38778875588b17")
@@ -70,7 +77,8 @@ def build_sample(tok, ctx_len, n_needles, n_queries, rng):
 @torch.no_grad()
 def score(model, input_ids, val_spans, device):
     ids = torch.tensor([input_ids], device=device)
-    h = model.model(input_ids=ids, use_cache=False).last_hidden_state[0]
+    with sdpa_kernel(_SDPA_BACKENDS):
+        h = model.model(input_ids=ids, use_cache=False).last_hidden_state[0]
     n_correct = 0
     for s, e, vtok in val_spans:
         pred = model.lm_head(h[s - 1:e - 1]).argmax(-1).tolist()
@@ -107,33 +115,43 @@ def load_teacher(device):
     return m.to(device).eval()
 
 
-def load_student(ckpt_dir, rout, device):
-    os.environ["GDN3_KMD2"] = "1"
-    os.environ["GDN3_KMD2_R"] = "1"
+def load_student(ckpt_dir, rout, device, native=False, dtype=torch.float32):
+    if native:
+        os.environ["GDN3_KMD2_NATIVE"] = "1"
+    else:
+        os.environ["GDN3_KMD2"] = "1"
+        os.environ["GDN3_KMD2_R"] = "1"
     os.environ["GDN3_KMD2_ROUT"] = str(rout)
     from transformers import AutoModelForCausalLM
     from gdn3.gdn3_upgrade import GDN3UpgradeManager
-    m = AutoModelForCausalLM.from_pretrained(SNAP, torch_dtype=torch.float32,
+    m = AutoModelForCausalLM.from_pretrained(SNAP, torch_dtype=dtype,
                                              low_cpu_mem_usage=True)
     mgr = GDN3UpgradeManager(m); mgr.apply_upgrade()
     sd = torch.load(os.path.join(ckpt_dir, "gdn3_layers.pt"), map_location="cpu")
     missing, unexpected = m.load_state_dict(sd, strict=False)
     assert not unexpected, f"unexpected keys: {unexpected[:5]}"
     loaded = len(sd)
-    print(f"[student rout={rout}] loaded {loaded} tensors from {ckpt_dir}", flush=True)
+    tag = "native" if native else f"rout={rout}"
+    print(f"[student {tag}] loaded {loaded} tensors from {ckpt_dir}", flush=True)
     m.config.use_cache = False
-    return m.to(device).eval()
+    # upgraded mixers are built fp32 after the base load; cast the whole model so
+    # dtype is uniform (the scan upcasts to fp32 internally where it matters).
+    return m.to(device=device, dtype=dtype).eval()
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--which", required=True, choices=["teacher", "core", "rout4"])
+    ap.add_argument("--which", required=True, choices=["teacher", "core", "rout4", "native"])
     ap.add_argument("--device", default="cuda:1")
     ap.add_argument("--lengths", default="1024,2048,4096")
     ap.add_argument("--settings", default="16:1,16:4")
     ap.add_argument("--n-samples", type=int, default=4)
+    ap.add_argument("--ckpt", default="/home/dev/gdn3_fable/runs/kmd2_native_heal/final")
+    ap.add_argument("--rout", type=int, default=4)
+    ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
     ap.add_argument("--json-out", required=True)
     args = ap.parse_args()
+    dtype = getattr(torch, args.dtype)
     lengths = [int(x) for x in args.lengths.split(",")]
     settings = [tuple(int(y) for y in s.split(":")) for s in args.settings.split(",")]
 
@@ -141,6 +159,8 @@ def main():
     tok = AutoTokenizer.from_pretrained(SNAP)
     if args.which == "teacher":
         model = load_teacher(args.device)
+    elif args.which == "native":
+        model = load_student(args.ckpt, args.rout, args.device, native=True, dtype=dtype)
     elif args.which == "core":
         model = load_student("/home/dev/gdn3_fable/runs/kmd2_heal_core/final", 1, args.device)
     else:

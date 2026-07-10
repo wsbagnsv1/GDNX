@@ -1,3 +1,8 @@
+> ⚠️ **Historical (phase-0) release doc.** This describes the older two-timescale
+> package; some paths below (the `code/` tree) were pruned in this handoff copy.
+> **For the current state (KMD-2 working heal + fast kernel), start with
+> [`HANDOFF.md`](HANDOFF.md).**
+
 # GDN3 Two-Timescale Compaction — Release Package
 
 **Version**: 2.0.0-component-level-two-timescale  

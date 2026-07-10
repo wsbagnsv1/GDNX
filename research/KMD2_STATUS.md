@@ -202,3 +202,35 @@ scalar rate can't selectively suppress them; free-angle rot starts gentle and
 learns per-channel. (Partial-RoPE variant might be neutral; no path to a win.)
 FINAL ARCHITECTURE UNCHANGED. All author ideas now measured: rot=include,
 trap/lam_t=skip, MIMO widening=efficiency-only, data-dep RoPE=skip.
+
+## *** HEAL MILESTONE (2026-07-08): WORKING GDN+MIMO HEAL BEATS NATIVE BASELINE ***
+Warm-start-at-GDN-2-point + layerwise-distill heal (gdn3/kmd2_native.py) into
+Qwen3.5-0.8B. Two structural fixes from the postmortem: (1) native drop-in that
+IS the teacher at init (every native param warm-loaded; conv/rot/r_out=4/decoupled
+write/per-chan decay all IDENTITY-init) — verified functional pre-training (init
+per-layer relMSE 7e-3, KL 2e-4, RULER 4/4); (2) per-layer residual-stream MSE
+supervision alongside KL. Result: warm start begins near-converged (loss 0.074 vs
+19 cold), KL/layerwise flat-low, CE weakly-weighted (~2.28, slow ↓), gnorm ~2.7
+stable. Only 1315 steps @ seq_len 512 in 6.5h (Python scan 18s/step -> undertrained
+~2.7M tok), yet:
+
+RULER (16 needles, n=32, teacher-forced exact value) — heal (r_out=4) vs native teacher:
+  ctx    1q          4q                8q
+  512   1.00/1.00   0.96/0.76 (+.20)  0.85/0.70 (+.15)
+  1024  1.00/1.00   0.95/0.77 (+.18)  0.84/0.69 (+.15)
+  2048  1.00/1.00   0.88/0.77 (+.11)  0.82/0.70 (+.12)
+  4096  1.00/1.00   0.94/0.91 (+.03)  0.78/0.66 (+.12)
+  8192  1.00/1.00   0.84/0.88 (-.04)  0.66/0.70 (-.04)  <- crossover
+  16384 0.91/0.97   0.34/0.93 (-.59)  0.20/0.73 (-.53)  <- extrapolation cliff
+  32768 0.00/1.00   (n/a, collapsed)                    <- full collapse
+THREE REGIMES: (1) <=4k heal WINS every multi-query cell (MIMO payoff: r_out=4
+query slots read multiple values in one pass; single-slot native smears them —
+margin biggest at short ctx). (2) ~8k crossover (wash). (3) >=16k cliff: 16k = 32x
+the seq_len-512 train window -> cumulative rotation phase + per-token decay drift
+off-manifold; multi-value readout shatters first (harder readout breaks earlier),
+then single-query collapses at 32k. Cliff is a TRAIN-LENGTH artifact, not an arch
+flaw (teacher was long-pretrained, holds to 32k). First working GDN with MIMO that
+OUTPERFORMS the native baseline on retrieval within its training regime.
+NEXT LEVERS: (a) chunked/kernel scan (18s/step is the cost bottleneck; ~15x headroom
+per init-bench) to afford (b) longer-ctx training / length-extension (rotation-rate
+reg + decay floor) to push crossover & cliff rightward.
