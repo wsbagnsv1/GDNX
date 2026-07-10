@@ -280,10 +280,24 @@ class CompactCacheBlockDiagnostics:
 
 
 @dataclass(frozen=True)
+class CacheBlockObservation:
+    """Ephemeral full local attention passed synchronously to an observer."""
+
+    block_start: int
+    block_stop: int
+    candidate_positions: torch.Tensor
+    candidate_valid: torch.Tensor
+    attention_weights: torch.Tensor
+
+
+@dataclass(frozen=True)
 class QwenExactCacheDiagnostics:
     """Compact detached observations from the latest full-recompute scan."""
 
     update_scores: torch.Tensor
+    state_output_norm: torch.Tensor
+    cache_output_norm: torch.Tensor
+    final_output_norm: torch.Tensor
     blocks: tuple[CompactCacheBlockDiagnostics, ...]
     final_selected_positions: torch.Tensor
     final_selected_scores: torch.Tensor
@@ -351,6 +365,19 @@ class KMD2ExactCacheAttn(KMD2NativeAttn):
             raise TypeError("native must be a KMD2NativeAttn")
         if not isinstance(cache_config, CacheConfig):
             raise TypeError("cache_config must be a CacheConfig")
+        if cache_config.score != "exact_outer":
+            raise ValueError(
+                "KMD2ExactCacheAttn supports only cache.score=exact_outer; "
+                f"got {cache_config.score!r}"
+            )
+        if (
+            cache_config.coordinate_frame != "rotated_recurrence"
+            or cache_config.pre_rotation_diagnostic
+        ):
+            raise ValueError(
+                "KMD2ExactCacheAttn supports only the rotated_recurrence "
+                "coordinate frame with pre_rotation_diagnostic=false"
+            )
         _validate_model_config(native, model_config)
 
         replacement = copy.deepcopy(native)
@@ -374,7 +401,14 @@ class KMD2ExactCacheAttn(KMD2NativeAttn):
         )
         replacement.cache_config = cache_config
         replacement.last_cache_diagnostics = None
+        replacement._cache_diagnostic_observer = None
         return replacement
+
+    def set_cache_diagnostic_observer(self, observer) -> None:
+        """Set a synchronous ephemeral full-block observer, or disable it."""
+        if observer is not None and not callable(observer):
+            raise TypeError("cache diagnostic observer must be callable or None")
+        self._cache_diagnostic_observer = observer
 
     def _native_state_and_scores(
         self,
@@ -464,6 +498,17 @@ class KMD2ExactCacheAttn(KMD2NativeAttn):
                 sink_logit=self.cache_sink_logit,
             )
             cache_outputs.append(block_output)
+            observer = self._cache_diagnostic_observer
+            if observer is not None:
+                observer(
+                    CacheBlockObservation(
+                        block_start=block_start,
+                        block_stop=block_stop,
+                        candidate_positions=diagnostics.hit_ready_positions.detach(),
+                        candidate_valid=diagnostics.candidate_valid.detach(),
+                        attention_weights=diagnostics.attention_weights.detach(),
+                    )
+                )
             block_diagnostics.append(
                 _compact_read_diagnostics(
                     diagnostics,
@@ -489,6 +534,15 @@ class KMD2ExactCacheAttn(KMD2NativeAttn):
         assert state is not None
         self.last_cache_diagnostics = QwenExactCacheDiagnostics(
             update_scores=update_scores.detach().clone(),
+            state_output_norm=torch.linalg.vector_norm(
+                y_state.float(), dim=-1
+            ).detach(),
+            cache_output_norm=torch.linalg.vector_norm(
+                y_cache.float(), dim=-1
+            ).detach(),
+            final_output_norm=torch.linalg.vector_norm(
+                combined.float(), dim=-1
+            ).detach(),
             blocks=tuple(block_diagnostics),
             final_selected_positions=state.positions.detach().clone(),
             final_selected_scores=state.scores.detach().clone(),
@@ -642,16 +696,14 @@ def named_cache_parameters(
     return tuple(items)
 
 
-def build_cache_optimizer(
+def cache_parameter_group(
     model: torch.nn.Module,
     cache_config: CacheConfig,
     *,
     betas: tuple[float, float],
     eps: float,
-    scheduler: object | None = None,
-    scheduler_spec: object | None = None,
-) -> torch.optim.AdamW:
-    """Build the dedicated zero-decay cache AdamW group and projection hook."""
+) -> dict[str, object]:
+    """Return the stable cache group for a shared memory/cache AdamW."""
     if not isinstance(cache_config, CacheConfig):
         raise TypeError("cache_config must be a CacheConfig")
     if (
@@ -664,22 +716,46 @@ def build_cache_optimizer(
     if type(eps) not in (float, int) or not 0.0 < float(eps) < float("inf"):
         raise ValueError("eps must be finite and positive")
     named = named_cache_parameters(model)
-    optimizer = torch.optim.AdamW(
-        [
-            {
-                "params": [parameter for _, parameter in named],
-                "lr": cache_config.lr_cache,
-                "betas": (float(betas[0]), float(betas[1])),
-                "eps": float(eps),
-                "weight_decay": 0.0,
-            }
-        ]
-    )
+    return {
+        "name": "cache",
+        "params": [parameter for _, parameter in named],
+        "lr": cache_config.lr_cache,
+        "betas": (float(betas[0]), float(betas[1])),
+        "eps": float(eps),
+        "weight_decay": 0.0,
+    }
+
+
+def register_cache_amplitude_projection(
+    optimizer: torch.optim.Optimizer,
+    model: torch.nn.Module,
+):
+    """Install the post-step cache-amplitude clamp on an existing optimizer."""
+    if not isinstance(optimizer, torch.optim.Optimizer):
+        raise TypeError("optimizer must be a torch optimizer")
+    if hasattr(optimizer, "_kmd2_amplitude_projection_hook_handle"):
+        raise ValueError("cache amplitude projection is already registered")
+    named = named_cache_parameters(model)
+    optimizer_parameter_ids = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
     amplitudes = tuple(
         parameter
         for name, parameter in named
         if name.endswith(".cache_amplitude") or name == "cache_amplitude"
     )
+    missing = [
+        name
+        for name, parameter in named
+        if (name.endswith(".cache_amplitude") or name == "cache_amplitude")
+        and id(parameter) not in optimizer_parameter_ids
+    ]
+    if missing:
+        raise ValueError(
+            "optimizer is missing cache amplitude parameters: " + ", ".join(missing)
+        )
 
     def project_amplitudes(
         _optimizer: torch.optim.Optimizer,
@@ -690,9 +766,39 @@ def build_cache_optimizer(
             for amplitude in amplitudes:
                 amplitude.clamp_(0.0, 1.0)
 
-    hook_handle = optimizer.register_step_post_hook(project_amplitudes)
-    optimizer._kmd2_amplitude_projection_hook_handle = hook_handle
+    handle = optimizer.register_step_post_hook(project_amplitudes)
+    optimizer._kmd2_amplitude_projection_hook_handle = handle
+    return handle
+
+
+def build_cache_optimizer(
+    model: torch.nn.Module,
+    cache_config: CacheConfig,
+    *,
+    betas: tuple[float, float],
+    eps: float,
+    scheduler_factory=None,
+    scheduler_spec: object | None = None,
+) -> torch.optim.AdamW:
+    """Build the dedicated zero-decay cache AdamW group and projection hook."""
+    named = named_cache_parameters(model)
+    optimizer = torch.optim.AdamW(
+        [cache_parameter_group(model, cache_config, betas=betas, eps=eps)]
+    )
+    register_cache_amplitude_projection(optimizer, model)
     optimizer._kmd2_cache_parameter_names = tuple(name for name, _ in named)
+    if scheduler_factory is None:
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=lambda _step: 1.0
+        )
+    else:
+        if not callable(scheduler_factory):
+            raise TypeError("scheduler_factory must be callable or None")
+        scheduler = scheduler_factory(optimizer)
+    if getattr(scheduler, "optimizer", None) is not optimizer:
+        raise ValueError(
+            "scheduler_factory must return a scheduler bound to the new cache optimizer"
+        )
     optimizer._kmd2_shared_scheduler = scheduler
     optimizer._kmd2_scheduler_spec = copy.deepcopy(scheduler_spec)
     return optimizer
@@ -976,6 +1082,35 @@ def strict_load_cache_resume(
         raise
 
 
+def build_cache_optimizer_and_resume(
+    model: torch.nn.Module,
+    cache_config: CacheConfig,
+    checkpoint: object,
+    *,
+    expected_job_id: str,
+    betas: tuple[float, float],
+    eps: float,
+    scheduler_factory=None,
+    scheduler_spec: object | None = None,
+) -> torch.optim.AdamW:
+    """Build against installed cache params, then strictly restore optimizer state."""
+    optimizer = build_cache_optimizer(
+        model,
+        cache_config,
+        betas=betas,
+        eps=eps,
+        scheduler_factory=scheduler_factory,
+        scheduler_spec=scheduler_spec,
+    )
+    strict_load_cache_resume(
+        model,
+        checkpoint,
+        expected_job_id,
+        optimizer=optimizer,
+    )
+    return optimizer
+
+
 def load_native_then_install(
     model: torch.nn.Module,
     manager: object,
@@ -990,6 +1125,11 @@ def load_native_then_install(
     """Apply native mode, load its checkpoint, then atomically install cache layers."""
     if not isinstance(cache_config, CacheConfig):
         raise TypeError("cache_config must be a CacheConfig")
+    if optimizer is not None:
+        raise ValueError(
+            "a pre-install optimizer cannot reference future cache parameters; "
+            "use the two-phase build_cache_optimizer_and_resume helper after install"
+        )
     prior_native_mode = os.environ.get("GDN3_KMD2_NATIVE")
     os.environ["GDN3_KMD2_NATIVE"] = "1"
     try:

@@ -152,6 +152,54 @@ def test_from_native_rejects_wrong_type_and_double_install(
         )
 
 
+@pytest.mark.parametrize(
+    "score_policy",
+    [
+        "coupled_paper",
+        "residual_only",
+        "write_value",
+        "recency",
+        "reservoir",
+        "future_query_oracle",
+    ],
+)
+def test_from_native_rejects_every_non_exact_admission_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    score_policy: str,
+) -> None:
+    from research.kmd2_ablation.qwen_exact_cache import KMD2ExactCacheAttn
+
+    native = _native(monkeypatch)
+    cache_config = CacheConfig(score=score_policy)
+
+    with pytest.raises(ValueError, match="exact_outer"):
+        KMD2ExactCacheAttn.from_native(native, _model_config(), cache_config)
+
+
+@pytest.mark.parametrize(
+    "cache_config",
+    [
+        CacheConfig(
+            coordinate_frame="pre_rotation",
+            pre_rotation_diagnostic=True,
+        ),
+        CacheConfig(
+            coordinate_frame="rotated_recurrence",
+            pre_rotation_diagnostic=True,
+        ),
+    ],
+)
+def test_from_native_rejects_pre_rotation_cache_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    cache_config: CacheConfig,
+) -> None:
+    from research.kmd2_ablation.qwen_exact_cache import KMD2ExactCacheAttn
+
+    native = _native(monkeypatch)
+    with pytest.raises(ValueError, match="rotated_recurrence"):
+        KMD2ExactCacheAttn.from_native(native, _model_config(), cache_config)
+
+
 @pytest.mark.parametrize("r_out", [1, 4])
 def test_zero_amplitude_preserves_full_forward_and_inherited_gradients_but_opens_gate(
     monkeypatch: pytest.MonkeyPatch,
@@ -471,6 +519,18 @@ def test_reference_cache_scan_matches_independent_block_oracle_and_gradients(
     torch.testing.assert_close(diagnostics.final_selected_positions, state.positions)
     torch.testing.assert_close(diagnostics.final_selected_scores, state.scores)
     torch.testing.assert_close(diagnostics.final_selected_valid, state.valid)
+    torch.testing.assert_close(
+        diagnostics.state_output_norm,
+        torch.linalg.vector_norm(expected_state_output.float(), dim=-1),
+    )
+    torch.testing.assert_close(
+        diagnostics.cache_output_norm,
+        torch.linalg.vector_norm(expected_cache_output.float(), dim=-1),
+    )
+    torch.testing.assert_close(
+        diagnostics.final_output_norm,
+        torch.linalg.vector_norm(expected.float(), dim=-1),
+    )
     assert diagnostics.persistent_bytes == state.nbytes
     assert not hasattr(exact, "cache_state")
     assert not hasattr(exact, "persistent_cache")
@@ -568,7 +628,7 @@ def test_published_qwen_diagnostics_are_compact_across_many_cache_blocks(
 
     batch, steps, heads = 2, 65, 2
     final_width = cache_config.width
-    expected_elements = batch * steps * heads  # update_scores
+    expected_elements = 4 * batch * steps * heads  # scores + three output norms
     expected_elements += 3 * batch * heads * final_width
     for block_index, block in enumerate(diagnostics.blocks):
         start = block_index * cache_config.block_size
@@ -591,6 +651,89 @@ def test_published_qwen_diagnostics_are_compact_across_many_cache_blocks(
         for start in range(0, steps, cache_config.block_size)
     )
     assert expected_elements < old_candidate_lower_bound // 2
+
+
+def test_synchronous_block_observer_exposes_detached_full_local_attention_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from research.kmd2_ablation.qwen_exact_cache import KMD2ExactCacheAttn
+
+    native = _native(monkeypatch, r_out=1)
+    exact = KMD2ExactCacheAttn.from_native(
+        native,
+        _model_config(),
+        _cache_config(),
+    )
+    observed: list[dict[str, object]] = []
+
+    def observer(block) -> None:
+        for tensor in (
+            block.candidate_positions,
+            block.candidate_valid,
+            block.attention_weights,
+        ):
+            assert tensor.requires_grad is False
+            assert tensor.grad_fn is None
+        candidate_count = block.candidate_positions.shape[-1]
+        candidate_weights = block.attention_weights[..., :candidate_count]
+        sink_mass = block.attention_weights[..., -1]
+        valid_mass = torch.where(
+            block.candidate_valid,
+            candidate_weights,
+            torch.zeros_like(candidate_weights),
+        ).sum(dim=-1)
+        top_index = block.attention_weights.argmax(dim=-1)
+        gathered_position = torch.gather(
+            block.candidate_positions,
+            -1,
+            top_index.clamp_max(candidate_count - 1).unsqueeze(-1),
+        ).squeeze(-1)
+        top_position = torch.where(
+            top_index == candidate_count,
+            torch.full_like(gathered_position, -1),
+            gathered_position,
+        )
+        # A downstream evaluator can aggregate exact attention mass by gold ID.
+        gold_mass = torch.where(
+            block.candidate_valid & (block.candidate_positions == 1),
+            candidate_weights,
+            torch.zeros_like(candidate_weights),
+        ).sum(dim=-1)
+        observed.append(
+            {
+                "span": (block.block_start, block.block_stop),
+                "sink_mass": sink_mass.detach().clone(),
+                "valid_mass": valid_mass.detach().clone(),
+                "top_position": top_position.detach().clone(),
+                "gold_mass": gold_mass.detach().clone(),
+            }
+        )
+
+    exact.set_cache_diagnostic_observer(observer)
+    exact.cache_amplitude.data.fill_(0.4)
+    exact._scan(*_scan_inputs(r_out=1, seed=5675))
+
+    diagnostics = exact.last_cache_diagnostics
+    assert diagnostics is not None
+    assert [entry["span"] for entry in observed] == [(0, 2), (2, 4), (4, 5)]
+    assert len(observed) == len(diagnostics.blocks)
+    for entry, retained in zip(observed, diagnostics.blocks):
+        torch.testing.assert_close(entry["sink_mass"], retained.sink_mass)
+        torch.testing.assert_close(entry["top_position"], retained.top1_positions)
+        torch.testing.assert_close(
+            entry["valid_mass"] + entry["sink_mass"],
+            torch.ones_like(entry["sink_mass"]),
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        assert entry["gold_mass"].shape == retained.sink_mass.shape
+        assert not hasattr(retained, "attention_weights")
+        assert not hasattr(retained, "candidate_valid")
+        assert not hasattr(retained, "candidate_positions")
+
+    exact.set_cache_diagnostic_observer(None)
+    with pytest.raises(TypeError, match="callable"):
+        exact.set_cache_diagnostic_observer(object())
 
 
 @pytest.mark.parametrize("mask_dtype", [torch.bool, torch.int64, torch.float32])
@@ -1038,20 +1181,69 @@ def test_cache_optimizer_has_stable_named_group_shared_schedule_and_projection_h
 ) -> None:
     from research.kmd2_ablation.qwen_exact_cache import (
         build_cache_optimizer,
+        cache_parameter_group,
         named_cache_parameters,
+        register_cache_amplitude_projection,
     )
 
     model = _exact_cache_model(monkeypatch)
-    scheduler = object()
     scheduler_spec = {"name": "cosine", "warmup_steps": 7}
     cache_config = _cache_config()
     named = named_cache_parameters(model)
+    memory_parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    memory_group = {
+        "name": "memory",
+        "params": [memory_parameter],
+        "lr": 1.0e-3,
+        "weight_decay": 0.01,
+        "betas": (0.8, 0.95),
+        "eps": 1.0e-7,
+    }
+    cache_group = cache_parameter_group(
+        model,
+        cache_config,
+        betas=(0.8, 0.95),
+        eps=1.0e-7,
+    )
+    shared_optimizer = torch.optim.AdamW([memory_group, cache_group])
+    register_cache_amplitude_projection(shared_optimizer, model)
+    shared_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        shared_optimizer,
+        lr_lambda=lambda step: 1.0 / (step + 1),
+    )
+    base_lrs = [group["lr"] for group in shared_optimizer.param_groups]
+    memory_parameter.grad = torch.zeros_like(memory_parameter)
+    for _, parameter in named:
+        parameter.grad = torch.zeros_like(parameter)
+    shared_amplitudes = [
+        parameter
+        for name, parameter in named
+        if name.endswith(".cache_amplitude")
+    ]
+    with torch.no_grad():
+        shared_amplitudes[0].copy_(torch.tensor([1.2, -0.2]))
+        shared_amplitudes[1].copy_(torch.tensor([-4.0, 3.0]))
+    shared_optimizer.step()
+    shared_scheduler.step()
+    scaled_lrs = [group["lr"] for group in shared_optimizer.param_groups]
+    assert [scaled / base for scaled, base in zip(scaled_lrs, base_lrs)] == [
+        0.5,
+        0.5,
+    ]
+    torch.testing.assert_close(shared_amplitudes[0], torch.tensor([1.0, 0.0]))
+    torch.testing.assert_close(shared_amplitudes[1], torch.tensor([0.0, 1.0]))
+
     optimizer = build_cache_optimizer(
         model,
         cache_config,
         betas=(0.8, 0.95),
         eps=1.0e-7,
-        scheduler=scheduler,
+        scheduler_factory=lambda built_optimizer: (
+            torch.optim.lr_scheduler.LambdaLR(
+                built_optimizer,
+                lr_lambda=lambda step: 1.0 / (step + 1),
+            )
+        ),
         scheduler_spec=scheduler_spec,
     )
 
@@ -1064,7 +1256,11 @@ def test_cache_optimizer_has_stable_named_group_shared_schedule_and_projection_h
     assert optimizer.param_groups[0]["weight_decay"] == 0.0
     assert optimizer.param_groups[0]["betas"] == (0.8, 0.95)
     assert optimizer.param_groups[0]["eps"] == 1.0e-7
-    assert optimizer._kmd2_shared_scheduler is scheduler
+    assert isinstance(
+        optimizer._kmd2_shared_scheduler,
+        torch.optim.lr_scheduler.LambdaLR,
+    )
+    assert optimizer._kmd2_shared_scheduler.optimizer is optimizer
     assert optimizer._kmd2_scheduler_spec == scheduler_spec
     assert optimizer._kmd2_scheduler_spec is not scheduler_spec
 
@@ -1094,7 +1290,12 @@ def _initialized_cache_optimizer(model, cache_config):
         cache_config,
         betas=(0.85, 0.97),
         eps=1.0e-8,
-        scheduler=object(),
+        scheduler_factory=lambda built_optimizer: (
+            torch.optim.lr_scheduler.LambdaLR(
+                built_optimizer,
+                lr_lambda=lambda step: 1.0,
+            )
+        ),
         scheduler_spec={"name": "linear", "total_steps": 11},
     )
     with torch.no_grad():
@@ -1177,6 +1378,110 @@ def test_cache_resume_round_trips_exact_ordered_model_and_optimizer_state_atomic
     ):
         torch.testing.assert_close(actual.cpu(), expected, rtol=0.0, atol=0.0)
     _assert_nested_equal(fresh_optimizer.state_dict(), envelope["optimizer_state"])
+
+
+def test_two_phase_install_then_optimizer_build_strictly_resumes_new_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from research.kmd2_ablation.qwen_exact_cache import (
+        build_cache_optimizer_and_resume,
+        build_cache_resume,
+        load_native_then_install,
+        named_cache_parameters,
+    )
+
+    cache_config = _cache_config()
+    source_model = _exact_cache_model(monkeypatch)
+    source_optimizer = _initialized_cache_optimizer(source_model, cache_config)
+    full_resume = build_cache_resume(
+        source_model,
+        source_optimizer,
+        job_id="two-phase-job",
+    )
+
+    model_only_resume = build_cache_resume(
+        source_model,
+        None,
+        job_id="model-only-job",
+    )
+    model_only_target = _FakeQwenModel(_model_config())
+    model_only_manager = _FakeNativeManager(model_only_target)
+    installed = load_native_then_install(
+        model_only_target,
+        model_only_manager,
+        _model_config(),
+        cache_config,
+        None,
+        cache_resume=model_only_resume,
+        expected_job_id="model-only-job",
+    )
+    assert installed == (0, 2)
+    for (_, actual), expected in zip(
+        named_cache_parameters(model_only_target),
+        model_only_resume["cache_tensors"],
+    ):
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.0, atol=0.0)
+
+    full_target = _FakeQwenModel(_model_config())
+    full_manager = _FakeNativeManager(full_target)
+    load_native_then_install(
+        full_target,
+        full_manager,
+        _model_config(),
+        cache_config,
+        None,
+    )
+    resumed_optimizer = build_cache_optimizer_and_resume(
+        full_target,
+        cache_config,
+        full_resume,
+        expected_job_id="two-phase-job",
+        betas=(0.85, 0.97),
+        eps=1.0e-8,
+        scheduler_factory=lambda built_optimizer: (
+            torch.optim.lr_scheduler.LambdaLR(
+                built_optimizer,
+                lr_lambda=lambda step: 1.0,
+            )
+        ),
+        scheduler_spec={"name": "linear", "total_steps": 11},
+    )
+    expected_parameters = [
+        parameter for _, parameter in named_cache_parameters(full_target)
+    ]
+    assert resumed_optimizer.param_groups[0]["params"] == expected_parameters
+    assert resumed_optimizer._kmd2_shared_scheduler.optimizer is resumed_optimizer
+    _assert_nested_equal(
+        resumed_optimizer.state_dict(),
+        full_resume["optimizer_state"],
+    )
+    for (_, actual), expected in zip(
+        named_cache_parameters(full_target), full_resume["cache_tensors"]
+    ):
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.0, atol=0.0)
+
+
+def test_installer_rejects_optimizer_state_that_cannot_reference_future_cache_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from research.kmd2_ablation.qwen_exact_cache import load_native_then_install
+
+    target = _FakeQwenModel(_model_config())
+    manager = _FakeNativeManager(target)
+    preinstall_optimizer = torch.optim.AdamW(target.parameters(), lr=1.0e-3)
+
+    with pytest.raises(ValueError, match="two-phase"):
+        load_native_then_install(
+            target,
+            manager,
+            _model_config(),
+            _cache_config(),
+            None,
+            cache_resume={"not": "reachable"},
+            expected_job_id="job",
+            optimizer=preinstall_optimizer,
+        )
+    assert manager.events == []
 
 
 def _mutate_resume_envelope(envelope: dict[str, object], case: str) -> None:
@@ -1282,8 +1587,10 @@ def _relative_mse(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 
 @pytest.mark.cuda
+@pytest.mark.parametrize("r_out", [1, 4])
 def test_true_fast_qwen_cache_scan_matches_reference_across_scan_and_cache_blocks(
     monkeypatch: pytest.MonkeyPatch,
+    r_out: int,
 ) -> None:
     pytest.importorskip("triton")
     if not torch.cuda.is_available():
@@ -1308,7 +1615,7 @@ def test_true_fast_qwen_cache_scan_matches_reference_across_scan_and_cache_block
         read="rmsnorm",
         storage_dtype="bf16",
     )
-    monkeypatch.setenv("GDN3_KMD2_ROUT", "4")
+    monkeypatch.setenv("GDN3_KMD2_ROUT", str(r_out))
     native = KMD2NativeAttn(model_config, layer_idx=0).cuda()
     exact = KMD2ExactCacheAttn.from_native(
         native,
@@ -1316,7 +1623,10 @@ def test_true_fast_qwen_cache_scan_matches_reference_across_scan_and_cache_block
         cache_config,
     )
     with torch.no_grad():
-        exact.out_mix.copy_(torch.tensor([[0.1, 0.2, 0.3, 0.4]], device="cuda"))
+        if r_out == 4:
+            exact.out_mix.copy_(
+                torch.tensor([[0.1, 0.2, 0.3, 0.4]], device="cuda")
+            )
         exact.cache_gamma_q.copy_(
             torch.tensor(
                 [0.7, 0.9, 1.1, 1.3, 1.2, 0.8, 1.4, 0.6],
@@ -1333,9 +1643,17 @@ def test_true_fast_qwen_cache_scan_matches_reference_across_scan_and_cache_block
         exact.cache_amplitude.fill_(0.4)
 
     steps = kmd2_fast_scan.C + 1
-    generator = torch.Generator(device="cuda").manual_seed(5900)
+    generator = torch.Generator(device="cuda").manual_seed(5900 + r_out)
     q = (
-        torch.randn(1, steps, 1, 4, 8, generator=generator, device="cuda")
+        torch.randn(
+            1,
+            steps,
+            1,
+            r_out,
+            8,
+            generator=generator,
+            device="cuda",
+        )
         * 0.15
     )
     k = torch.nn.functional.normalize(
@@ -1366,11 +1684,19 @@ def test_true_fast_qwen_cache_scan_matches_reference_across_scan_and_cache_block
 
     state_actual_inputs = _clone_leaves(initial)
     state_expected_inputs = _clone_leaves(initial)
-    state_expected_out_mix = exact.out_mix.detach().clone().requires_grad_(True)
+    state_expected_out_mix = (
+        None
+        if r_out == 1
+        else exact.out_mix.detach().clone().requires_grad_(True)
+    )
 
     cache_actual_inputs = _clone_leaves(initial)
     cache_expected_inputs = _clone_leaves(initial)
-    cache_expected_out_mix = exact.out_mix.detach().clone().requires_grad_(True)
+    cache_expected_out_mix = (
+        None
+        if r_out == 1
+        else exact.out_mix.detach().clone().requires_grad_(True)
+    )
     cache_expected_gamma_q = (
         exact.cache_gamma_q.detach().clone().requires_grad_(True)
     )
@@ -1386,7 +1712,11 @@ def test_true_fast_qwen_cache_scan_matches_reference_across_scan_and_cache_block
 
     actual_inputs = _clone_leaves(initial)
     expected_inputs = _clone_leaves(initial)
-    expected_out_mix = exact.out_mix.detach().clone().requires_grad_(True)
+    expected_out_mix = (
+        None
+        if r_out == 1
+        else exact.out_mix.detach().clone().requires_grad_(True)
+    )
     expected_gamma_q = exact.cache_gamma_q.detach().clone().requires_grad_(True)
     expected_gamma_k = exact.cache_gamma_k.detach().clone().requires_grad_(True)
     expected_sink = exact.cache_sink_logit.detach().clone().requires_grad_(True)
@@ -1461,8 +1791,12 @@ def test_true_fast_qwen_cache_scan_matches_reference_across_scan_and_cache_block
     )
 
     state_probe = torch.randn(actual.shape, generator=generator, device="cuda")
-    state_actual_targets = [*state_actual_inputs, exact.out_mix]
-    state_expected_targets = [*state_expected_inputs, state_expected_out_mix]
+    state_actual_targets = [*state_actual_inputs]
+    state_expected_targets = [*state_expected_inputs]
+    if r_out == 4:
+        state_actual_targets.append(exact.out_mix)
+        assert state_expected_out_mix is not None
+        state_expected_targets.append(state_expected_out_mix)
     actual_state_gradients = torch.autograd.grad(
         actual_state_output,
         state_actual_targets,
@@ -1484,15 +1818,17 @@ def test_true_fast_qwen_cache_scan_matches_reference_across_scan_and_cache_block
         exact.cache_gamma_q,
         exact.cache_gamma_k,
         exact.cache_sink_logit,
-        exact.out_mix,
     ]
     cache_expected_targets = [
         *cache_expected_inputs[:3],
         cache_expected_gamma_q,
         cache_expected_gamma_k,
         cache_expected_sink,
-        cache_expected_out_mix,
     ]
+    if r_out == 4:
+        cache_actual_targets.append(exact.out_mix)
+        assert cache_expected_out_mix is not None
+        cache_expected_targets.append(cache_expected_out_mix)
     actual_cache_gradients = torch.autograd.grad(
         actual_cache_output,
         cache_actual_targets,
@@ -1515,7 +1851,6 @@ def test_true_fast_qwen_cache_scan_matches_reference_across_scan_and_cache_block
         exact.cache_gamma_k,
         exact.cache_sink_logit,
         exact.cache_amplitude,
-        exact.out_mix,
     ]
     expected_targets = [
         *expected_inputs,
@@ -1523,8 +1858,11 @@ def test_true_fast_qwen_cache_scan_matches_reference_across_scan_and_cache_block
         expected_gamma_k,
         expected_sink,
         expected_amplitude,
-        expected_out_mix,
     ]
+    if r_out == 4:
+        actual_targets.append(exact.out_mix)
+        assert expected_out_mix is not None
+        expected_targets.append(expected_out_mix)
     actual_gradients = torch.autograd.grad(actual, actual_targets, probe)
     expected_gradients = torch.autograd.grad(expected, expected_targets, probe)
     for actual_gradient, expected_gradient in zip(
