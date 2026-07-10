@@ -42,6 +42,20 @@ TASK_NAMES = frozenset(_TASK_ENTRY_POINTS)
 class _FrozenJSONDict(dict[str, Any]):
     """A JSON-serializable dict whose mutation methods are disabled."""
 
+    __slots__ = ("_locked",)
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        if getattr(self, "_locked", False):
+            raise TypeError("frozen JSON mappings are immutable")
+        dict.__init__(self, *args, **kwargs)
+        object.__setattr__(self, "_locked", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_locked" and not hasattr(self, "_locked"):
+            object.__setattr__(self, name, value)
+            return
+        raise TypeError("frozen JSON mappings are immutable")
+
     @staticmethod
     def _immutable(*_args: object, **_kwargs: object) -> None:
         raise TypeError("frozen JSON mappings are immutable")
@@ -53,6 +67,7 @@ class _FrozenJSONDict(dict[str, Any]):
     popitem = _immutable
     setdefault = _immutable
     update = _immutable
+    __ior__ = _immutable
 
 
 def _tensor_storage_key(tensor: Tensor) -> int:

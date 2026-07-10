@@ -250,6 +250,16 @@ def test_episode_metadata_is_deeply_immutable_and_json_serializable() -> None:
     original["nested"]["items"][1]["value"] = 99  # type: ignore[index]
     assert episode.metadata[0]["nested"]["items"][1]["value"] == 2
 
+    nested = episode.metadata[0]["nested"]
+    with pytest.raises(TypeError, match="immutable"):
+        nested |= {"new": 3}
+    assert "new" not in nested
+
+    with pytest.raises(TypeError, match="immutable"):
+        nested.__init__({"replacement": True})
+    assert "replacement" not in nested
+    assert nested["items"][1]["value"] == 2
+
 
 def test_example_identity_includes_canonical_validated_params_and_task_schema(
     monkeypatch: pytest.MonkeyPatch,
