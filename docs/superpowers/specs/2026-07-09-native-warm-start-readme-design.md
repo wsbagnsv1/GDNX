@@ -80,6 +80,11 @@ Describe only the trained native path:
 - per-head write-beta offset that decouples write from erase
 - dense `dk x dv` recurrent state initialized to zero on every forward call
 
+State explicitly that the warm start is only an **approximate** native identity:
+the small, nonzero rotation is applied cumulatively, so initialization is not
+mathematically identical to native Qwen linear attention. Do not describe it as
+an exact or perfect identity initialization.
+
 State explicitly that this path does **not** implement:
 
 - rank-r writes
@@ -293,6 +298,14 @@ Implementation is complete only when all checks pass:
 7. Fast-scan wording distinguishes recorded microbenchmark evidence from fresh
    end-to-end training evidence.
 8. `git diff --check` passes for the documentation changes.
-9. No source code, data, checkpoint, or result file changes.
-10. Final `git status --short --branch --untracked-files=all` is clean after the
+9. Every native architecture/state statement in README section 2 is traced to
+   `gdn3/kmd2_native.py`, including approximate initialization, shared-query
+   output slots, decay/write offsets, forward-local dense state, and explicitly
+   absent compaction/cache features.
+10. The `HANDOFF.md` content beginning at `## TL;DR` is byte-for-byte unchanged;
+    only the opening reference above that heading is updated.
+11. The README retains the MIT `LICENSE` link and the existing copyright
+    identity.
+12. No source code, data, checkpoint, or result file changes.
+13. Final `git status --short --branch --untracked-files=all` is clean after the
     documentation commit.
