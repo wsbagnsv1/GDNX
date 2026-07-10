@@ -10,22 +10,61 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 def test_package_imports_without_qwen_dependencies():
     import_script = textwrap.dedent(
         """
-        import builtins
+        import importlib
+        import sys
+        from importlib.abc import MetaPathFinder
 
-        original_import = builtins.__import__
+        blocked_dependency_roots = {"transformers", "triton"}
 
-        def reject_optional_dependencies(name, *args, **kwargs):
-            if name == "transformers" or name.startswith("transformers."):
-                raise AssertionError(f"unexpected optional dependency import: {name}")
-            if name == "triton" or name.startswith("triton."):
-                raise AssertionError(f"unexpected optional dependency import: {name}")
-            return original_import(name, *args, **kwargs)
+        class RejectOptionalDependencies(MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname.partition(".")[0] in blocked_dependency_roots:
+                    raise AssertionError(
+                        f"unexpected optional dependency import: {fullname}"
+                    )
+                return None
 
-        builtins.__import__ = reject_optional_dependencies
+        sys.meta_path.insert(0, RejectOptionalDependencies())
+
+        def import_transformers():
+            import transformers
+
+        def import_triton():
+            import triton
+
+        def assert_import_is_blocked(importer, dependency, mechanism):
+            try:
+                importer()
+            except AssertionError as exc:
+                expected = f"unexpected optional dependency import: {dependency}"
+                assert str(exc) == expected
+            else:
+                raise AssertionError(
+                    f"{mechanism} did not block optional dependency: {dependency}"
+                )
+
+        assert_import_is_blocked(
+            import_transformers,
+            "transformers",
+            "ordinary import",
+        )
+        assert_import_is_blocked(import_triton, "triton", "ordinary import")
+        assert_import_is_blocked(
+            lambda: importlib.import_module("transformers"),
+            "transformers",
+            "importlib.import_module",
+        )
+        assert_import_is_blocked(
+            lambda: importlib.import_module("triton"),
+            "triton",
+            "importlib.import_module",
+        )
 
         import research.kmd2_ablation as suite
 
         assert suite.SUITE_VERSION == "1.0.0"
+        public_names = {name for name in vars(suite) if not name.startswith("_")}
+        assert public_names == {"SUITE_VERSION"}
         """
     )
 
@@ -35,6 +74,7 @@ def test_package_imports_without_qwen_dependencies():
         capture_output=True,
         text=True,
         check=False,
+        timeout=15,
     )
 
     assert result.returncode == 0, result.stderr
