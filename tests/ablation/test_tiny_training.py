@@ -1,20 +1,43 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from research.kmd2_ablation.config import CacheConfig
+from research.kmd2_ablation.config import CacheConfig, ExperimentConfig
+from research.kmd2_ablation.results import (
+    ResultStore,
+    _EXACT_CACHE_FIELDS,
+    assign_shard,
+    build_job,
+    canonical_json_bytes,
+)
+from research.kmd2_ablation.runner import (
+    ForcedOOM,
+    MalformedInput,
+    NonFiniteGradient,
+    build_completed_record,
+    execute_jobs,
+)
 from research.kmd2_ablation.tasks import EpisodeBatch, generate_task
 from research.kmd2_ablation.tiny_backend import TinyKMD2Config, TinyKMD2Model
 from research.kmd2_ablation.tiny_training import (
     TINY_CHECKPOINT_SCHEMA_VERSION,
+    TinyExecutionDependencies,
+    TinyRuntimeConfigurationError,
     TinyTrainer,
     TinyTrainingConfig,
+    _exact_cache_payload,
+    build_job_dispatcher,
+    run_job,
 )
+from research.kmd2_ablation.variants import all_variants, get_variant
+from tests.ablation.test_config import minimal_config_dict
 
 
 def _model_config(*, cache: bool = False, modality: str = "token") -> TinyKMD2Config:
@@ -74,6 +97,872 @@ def _training_config(job_id: str = "tiny-job") -> TinyTrainingConfig:
         weight_decay=0.01,
         warmup_updates=2,
         max_grad_norm=1.0,
+    )
+
+
+def test_tiny_run_job_requires_explicit_runtime_binding() -> None:
+    with pytest.raises(
+        TinyRuntimeConfigurationError, match="runtime_required"
+    ) as caught:
+        run_job({})
+    assert caught.value.code == "runtime_required"
+
+
+def _dispatcher_job(
+    arm_id: str = "native",
+    *,
+    task: str = "parity",
+    params: dict[str, object] | None = None,
+) -> dict[str, object]:
+    spec = get_variant(arm_id)
+    raw = minimal_config_dict()
+    raw["backend"] = "tiny"
+    raw["mechanism"] = spec.mechanism
+    raw["variant"] = spec.variant
+    raw["task"] = {"name": task, "params": {} if params is None else params}
+    raw["seeds"] = [211]
+    raw["budget"] = {
+        "tokens": 28 if task == "mqar" else 12,
+        "updates": 2,
+    }
+    raw["schedule"]["warmup_updates"] = 1
+    raw["model"] = {
+        "hidden_size": 8,
+        "num_layers": 1,
+        "num_heads": 1,
+        "state_key_dim": 2,
+        "state_value_dim": 2,
+        "ffn_dim": 16,
+        "ffn_match_lower": 8,
+        "ffn_match_upper": 24,
+    }
+    raw["lengths"] = {
+        "curriculum": [4 if task == "mqar" else 2],
+        "extrapolation": [2 if task == "irregular_integration" else 1],
+    }
+    raw["evaluation"] = {"primary_metric": "exact_match", "direction": "maximize"}
+    raw["device_preferences"] = ["cpu"]
+    raw["dtype_preferences"] = ["float32"]
+    raw["required_stage"] = spec.required_stage
+    raw["cache"].update(
+        {
+            "width": 0 if arm_id == "exact_cache.current_block_only" else 2,
+            "block_size": 2,
+            "storage_dtype": "fp32",
+        }
+    )
+    selector_scores = {
+        "exact_cache.selector.exact_outer": "exact_outer",
+        "exact_cache.selector.coupled_paper": "coupled_paper",
+        "exact_cache.selector.residual_only": "residual_only",
+        "exact_cache.selector.write_value": "write_value",
+        "exact_cache.selector.recency": "recency",
+        "exact_cache.selector.reservoir": "reservoir",
+        "exact_cache.selector.future_query_oracle": "future_query_oracle",
+    }
+    if arm_id in selector_scores:
+        raw["cache"]["score"] = selector_scores[arm_id]
+    config = ExperimentConfig.from_dict(raw)
+    return build_job(
+        config,
+        seed=211,
+        stage=spec.required_stage,
+        backend="tiny",
+        arm_id=arm_id,
+    )
+
+
+def _dispatcher_runtime(tmp_path: Path, *, resume: bool = True) -> dict[str, object]:
+    return {
+        "output": tmp_path,
+        "dtype": "float32",
+        "asset_hashes": {},
+        "resume": resume,
+    }
+
+
+def _provenance_for(job: dict[str, object]) -> dict[str, object]:
+    return {
+        "schema_version": "1.0.0",
+        "suite_version": "1.0.0",
+        "source_hashes": {"tiny_training.py": "a" * 64},
+        "config_hash": hashlib.sha256(
+            canonical_json_bytes(job["canonical_config"])
+        ).hexdigest(),
+        "asset_hashes": {},
+        "git": {"revision": "abc", "diff_hash": "b" * 64, "dirty": True},
+        "environment": {
+            "python": "test",
+            "pytorch": str(torch.__version__),
+            "cuda": None,
+            "gpu": None,
+            "dependencies": {},
+        },
+    }
+
+
+def test_tiny_bound_dispatcher_runs_exact_budget_and_builds_valid_record(
+    tmp_path: Path,
+) -> None:
+    job = _dispatcher_job()
+    ticks = iter((10.0, 12.0))
+    dispatcher = build_job_dispatcher(
+        _dispatcher_runtime(tmp_path),
+        dependencies={"monotonic": lambda: next(ticks)},
+    )
+    payload = dispatcher(job)
+    assert payload["loss_curves"]["train"] and len(
+        payload["loss_curves"]["train"]
+    ) == 2
+    assert payload["training"] == {
+        "updates_completed": 2,
+        "tokens_seen": 12,
+        "examples_seen": 2,
+    }
+    assert payload["parameters"]["trainable"] == payload["parameters"]["total"]
+    assert payload["performance"]["wall_time_seconds"] == 2.0
+    assert payload["performance"]["peak_vram_bytes"] == 0
+    provenance = _provenance_for(job)
+    shard_index = assign_shard(str(job["job_id"]), 1)
+    record = build_completed_record(
+        job,
+        provenance,
+        shard_index=shard_index,
+        num_jobs=1,
+        command=["python", "-m", "research.kmd2_ablation.run_ablation", "run"],
+        payload=payload,
+    )
+    assert record["status"] == "completed"
+
+
+def test_tiny_cache_dispatcher_reports_measured_exact_cache_fields(
+    tmp_path: Path,
+) -> None:
+    job = _dispatcher_job(
+        "exact_cache.selector.exact_outer", task="mqar", params={"width": 4}
+    )
+    ticks = iter((20.0, 21.0))
+    payload = build_job_dispatcher(
+        _dispatcher_runtime(tmp_path),
+        dependencies={"monotonic": lambda: next(ticks)},
+    )(job)
+    diagnostics = payload["exact_cache"]
+    assert diagnostics["width"] == 2
+    assert diagnostics["block_size"] == 2
+    assert diagnostics["retention_count"] > 0
+    assert diagnostics["eviction_count"] > 0
+    assert diagnostics["score_statistics"]["count"] > 0
+    assert len(diagnostics["selected_index_digest"]) == 64
+    assert len(diagnostics["score_digest"]) == 64
+    assert diagnostics["implementation_paths"] == {
+        "scan": "tiny_backend.TinyKMD2Cell._forward_fp32",
+        "score": "exact_cache.admission_scores.exact_outer",
+        "selection": "exact_cache.merge_persistent_cache.deterministic_topw",
+        "read": "exact_cache.cache_read_blocks.unit_l2",
+    }
+    build_completed_record(
+        job,
+        _provenance_for(job),
+        shard_index=0,
+        num_jobs=1,
+        command=["python", "run"],
+        payload=payload,
+    )
+
+
+@pytest.mark.parametrize(
+    "arm_id",
+    [
+        "exact_cache.selector.coupled_paper",
+        "exact_cache.selector.residual_only",
+        "exact_cache.selector.write_value",
+        "exact_cache.selector.recency",
+        "exact_cache.selector.reservoir",
+        "exact_cache.selector.future_query_oracle",
+    ],
+)
+def test_tiny_selector_policy_arms_execute_real_jobs(
+    arm_id: str, tmp_path: Path
+) -> None:
+    job = _dispatcher_job(arm_id, task="mqar", params={"width": 4})
+    payload = build_job_dispatcher(_dispatcher_runtime(tmp_path))(job)
+    expected = {
+        "exact_cache.selector.coupled_paper": "coupled_paper",
+        "exact_cache.selector.residual_only": "residual_only",
+        "exact_cache.selector.write_value": "write_value",
+        "exact_cache.selector.recency": "recency",
+        "exact_cache.selector.reservoir": "reservoir",
+        "exact_cache.selector.future_query_oracle": "future_query_oracle",
+    }[arm_id]
+    assert payload["exact_cache"]["score_definition"] == expected
+    assert payload["exact_cache"]["selector_seed"] == job["seed"]
+    assert payload["exact_cache"]["selector_policy"] == expected
+    assert payload["training"]["updates_completed"] == 2
+
+
+def _cache_alias_job(
+    arm_id: str,
+    *,
+    cache_updates: dict[str, object] | None = None,
+    params: dict[str, object] | None = None,
+) -> dict[str, object]:
+    base = _dispatcher_job(
+        "exact_cache.selector.exact_outer",
+        task="mqar",
+        params={"width": 4, **({} if params is None else params)},
+    )
+    semantic = copy.deepcopy(base["canonical_config"])
+    spec = get_variant(arm_id)
+    semantic["required_stage"] = spec.required_stage
+    if cache_updates:
+        semantic["cache"].update(cache_updates)
+    return build_job(
+        semantic,
+        seed=base["seed"],
+        stage=spec.required_stage,
+        backend="tiny",
+        arm_id=arm_id,
+    )
+
+
+@pytest.mark.parametrize(
+    ("arm_id", "cache_updates"),
+    [
+        ("exact_cache.read.unit_l2", {"read": "unit_l2"}),
+        ("exact_cache.read.fixed_temperature", {"read": "fixed_temperature"}),
+        ("exact_cache.read.rmsnorm", {"read": "rmsnorm"}),
+        ("exact_cache.storage.bf16", {"storage_dtype": "bf16"}),
+        ("exact_cache.storage.fp32", {"storage_dtype": "fp32"}),
+        (
+            "exact_cache.pre_rotation_diagnostic",
+            {"coordinate_frame": "pre_rotation", "pre_rotation_diagnostic": True},
+        ),
+    ],
+)
+def test_tiny_cache_alias_arms_validate_declared_control_and_execute(
+    arm_id: str, cache_updates: dict[str, object], tmp_path: Path
+) -> None:
+    job = _cache_alias_job(arm_id, cache_updates=cache_updates)
+    payload = build_job_dispatcher(_dispatcher_runtime(tmp_path))(job)
+    diagnostics = payload["exact_cache"]
+    if "read" in cache_updates:
+        assert diagnostics["implementation_paths"]["read"].endswith(
+            str(cache_updates["read"])
+        )
+    if "storage_dtype" in cache_updates:
+        assert diagnostics["storage_dtype"] == cache_updates["storage_dtype"]
+    if "coordinate_frame" in cache_updates:
+        assert diagnostics["coordinate_frame"] == "pre_rotation"
+
+
+@pytest.mark.parametrize(
+    ("arm_id", "params"),
+    [
+        ("exact_cache.per_slot_read", {"width": 4, "r_out": 4}),
+        ("exact_cache.unbounded_oracle", {"width": 4}),
+    ],
+)
+def test_tiny_cache_diagnostic_arms_execute_their_real_backend_paths(
+    arm_id: str, params: dict[str, object], tmp_path: Path
+) -> None:
+    job = _dispatcher_job(arm_id, task="mqar", params=params)
+    diagnostics = build_job_dispatcher(_dispatcher_runtime(tmp_path))(job)[
+        "exact_cache"
+    ]
+    if arm_id.endswith("per_slot_read"):
+        assert diagnostics["per_slot_read"] is True
+        assert diagnostics["slot_count"] == 4
+        assert diagnostics["slot_top1_position_digest"] != hashlib.sha256(
+            b"[]"
+        ).hexdigest()
+    else:
+        assert diagnostics["unbounded_cache"] is True
+        assert diagnostics["effective_width"] > diagnostics["declared_width"]
+        assert diagnostics["eviction_count"] == 0
+
+
+def test_tiny_per_slot_diagnostics_ignore_invalid_padding() -> None:
+    cache = CacheConfig(width=1, block_size=2, storage_dtype="fp32")
+    model_config = TinyKMD2Config(
+        d_model=8,
+        heads=1,
+        dk=2,
+        dv=2,
+        layers=1,
+        vocab_size=8,
+        d_ff=16,
+        r_out=2,
+        rotation_mode="none",
+        cache=cache,
+        per_slot_cache_read=True,
+    )
+    episode = EpisodeBatch(
+        task="mqar",
+        split="id",
+        seed=431,
+        example_ids=("padded",),
+        input_ids=torch.tensor([[1, 0, 2]]),
+        continuous_inputs=None,
+        direct_factors=None,
+        targets=torch.tensor([[-100, -100, 3]]),
+        valid=torch.tensor([[True, False, True]]),
+        positions=torch.tensor([[0, -1, 1]]),
+        loss_mask=torch.tensor([[False, False, True]]),
+        query_mask=torch.tensor([[False, False, True]]),
+        boundaries=torch.tensor([[True, False, False]]),
+        source_spans=torch.tensor([[[-1, -1], [-1, -1], [0, 1]]]),
+        strata={},
+        metadata=({},),
+    )
+    with torch.no_grad():
+        output = TinyKMD2Model(model_config, init_seed=431).forward_episode(episode)
+    cell = output.cell_outputs[0]
+
+    def poison_invalid(tensor: torch.Tensor, value: float | int) -> torch.Tensor:
+        poisoned = tensor.clone()
+        poisoned[~episode.valid] = value
+        return poisoned
+
+    poisoned_cell = replace(
+        cell,
+        slot_cache_read=poison_invalid(cell.slot_cache_read, 1000.0),
+        slot_sink_mass=poison_invalid(cell.slot_sink_mass, 1000.0),
+        slot_attention_entropy=poison_invalid(
+            cell.slot_attention_entropy, 1000.0
+        ),
+        slot_top1_mass=poison_invalid(cell.slot_top1_mass, 1000.0),
+        slot_top1_positions=poison_invalid(cell.slot_top1_positions, 999),
+    )
+    poisoned_output = replace(output, cell_outputs=(poisoned_cell,))
+    config = SimpleNamespace(cache=cache)
+
+    def diagnostics(candidate) -> dict[str, object]:
+        return _exact_cache_payload(
+            config,
+            model_config,
+            ((episode, candidate),),
+            amplitude_initial=(0.0,),
+            amplitude_final=(0.0,),
+            cache_active=True,
+        )
+
+    baseline = diagnostics(output)
+    poisoned = diagnostics(poisoned_output)
+    for field in (
+        "slot_sink_mass",
+        "slot_attention_entropy",
+        "slot_top1_mass",
+        "slot_cache_output_norm",
+        "slot_top1_position_digest",
+    ):
+        assert poisoned[field] == baseline[field]
+
+
+def _cache_geometry_job(arm_id: str) -> dict[str, object]:
+    spec = get_variant(arm_id)
+    declared_width = (
+        int(arm_id.rsplit(".", 1)[1])
+        if arm_id.startswith("exact_cache.width.")
+        else 2
+    )
+    declared_block = (
+        int(arm_id.rsplit(".", 1)[1])
+        if arm_id.startswith("exact_cache.block.")
+        else 2
+    )
+    base = _cache_alias_job(arm_id)
+    semantic = copy.deepcopy(base["canonical_config"])
+    semantic["cache"]["width"] = declared_width
+    semantic["cache"]["block_size"] = declared_block
+    if declared_width == 0:
+        semantic["mechanism"] = "current_block_only"
+        semantic["variant"] = "chunk_only"
+    screen_length = max(4, 2 * declared_block, declared_width + 1)
+    semantic["lengths"]["curriculum"] = [screen_length]
+    example = generate_task(
+        "mqar", 1, screen_length, 211, "train", {"width": 4}
+    )
+    semantic["budget"]["tokens"] = 2 * int(example.valid.sum().item())
+    return build_job(
+        semantic,
+        seed=211,
+        stage=spec.required_stage,
+        backend="tiny",
+        arm_id=arm_id,
+    )
+
+
+@pytest.mark.parametrize(
+    "arm_id",
+    [
+        "exact_cache.width.0",
+        "exact_cache.width.8",
+        "exact_cache.width.16",
+        "exact_cache.width.32",
+        "exact_cache.width.64",
+        "exact_cache.width.128",
+        "exact_cache.block.64",
+        "exact_cache.block.128",
+        "exact_cache.block.256",
+    ],
+)
+def test_tiny_cache_geometry_registry_arms_execute_declared_geometry(
+    arm_id: str, tmp_path: Path
+) -> None:
+    job = _cache_geometry_job(arm_id)
+    diagnostics = build_job_dispatcher(_dispatcher_runtime(tmp_path))(job)[
+        "exact_cache"
+    ]
+    if arm_id.startswith("exact_cache.width."):
+        assert diagnostics["declared_width"] == int(arm_id.rsplit(".", 1)[1])
+    else:
+        assert diagnostics["block_size"] == int(arm_id.rsplit(".", 1)[1])
+
+
+def _factorial_cell_job(arm_id: str) -> dict[str, object]:
+    family = arm_id.rsplit(".", 1)[0]
+    base = _dispatcher_job(
+        family,
+        task="far_surprise",
+        params={"four_cells": ["M00", "M10", "M01", "M11"]},
+    )
+    semantic = copy.deepcopy(base["canonical_config"])
+    example = generate_task("far_surprise", 1, 2, 211, "train", {})
+    semantic["budget"]["tokens"] = 2 * int(example.valid.sum().item())
+    return build_job(
+        semantic,
+        seed=211,
+        stage=get_variant(arm_id).required_stage,
+        backend="tiny",
+        arm_id=arm_id,
+    )
+
+
+@pytest.mark.parametrize(
+    "arm_id",
+    [
+        f"exact_cache.{family}_factorial.{cell}"
+        for family in ("rotation", "r_out")
+        for cell in ("M00", "M10", "M01", "M11")
+    ],
+)
+def test_tiny_factorial_cells_execute_exact_cache_and_feature_bits(
+    arm_id: str, tmp_path: Path
+) -> None:
+    cell = arm_id.rsplit(".", 1)[1]
+    payload = build_job_dispatcher(_dispatcher_runtime(tmp_path))(
+        _factorial_cell_job(arm_id)
+    )
+    diagnostics = payload["exact_cache"]
+    assert diagnostics["cache_active"] is (cell[1] == "1")
+    if cell in {"M00", "M01"}:
+        assert diagnostics["implementation_paths"] == {
+            "scan": "tiny_backend.TinyKMD2Cell._forward_fp32",
+            "score": "tiny_backend.TinyKMD2Cell._forward_fp32.native_score",
+            "selection": "disabled_no_cache",
+            "read": "disabled_no_cache",
+        }
+    if ".r_out_factorial." in arm_id:
+        assert diagnostics["model_r_out"] == (4 if cell[2] == "1" else 1)
+    else:
+        assert diagnostics["rotation_mode"] == (
+            "current" if cell[2] == "1" else "none"
+        )
+
+
+def test_tiny_resume_keeps_completed_checkpoint_bytes_and_curve_length(
+    tmp_path: Path,
+) -> None:
+    job = _dispatcher_job()
+    first_ticks = iter((1.0, 2.0))
+    first = build_job_dispatcher(
+        _dispatcher_runtime(tmp_path),
+        dependencies={"monotonic": lambda: next(first_ticks)},
+    )(job)
+    checkpoint = tmp_path / "checkpoints" / str(job["job_id"]) / "latest.pt"
+    before = checkpoint.read_bytes()
+    second_ticks = iter((3.0, 4.0))
+    resumed = build_job_dispatcher(
+        _dispatcher_runtime(tmp_path),
+        dependencies={"monotonic": lambda: next(second_ticks)},
+    )(job)
+    assert checkpoint.read_bytes() == before
+    assert len(first["loss_curves"]["train"]) == 2
+    assert resumed["loss_curves"]["train"] == first["loss_curves"]["train"]
+    assert resumed["training"] == first["training"]
+
+
+def test_tiny_dispatcher_translates_task_generation_failure_to_malformed_input(
+    tmp_path: Path,
+) -> None:
+    job = _dispatcher_job()
+
+    def malformed(*_args, **_kwargs):
+        raise ValueError("injected malformed episode")
+
+    dependencies = TinyExecutionDependencies(
+        generate_task=malformed,
+        build_model=TinyKMD2Model,
+        build_trainer=TinyTrainer,
+        monotonic=lambda: 0.0,
+        peak_vram_bytes=lambda: 0,
+    )
+    with pytest.raises(MalformedInput, match="injected malformed episode"):
+        build_job_dispatcher(
+            _dispatcher_runtime(tmp_path), dependencies=dependencies
+        )(job)
+
+
+def test_tiny_dispatcher_arm_table_exhaustively_classifies_registry_support() -> None:
+    from research.kmd2_ablation import tiny_training
+
+    tiny_arms = {
+        spec.arm_id for spec in all_variants() if "tiny" in spec.compatible_backends
+    }
+    assert set(tiny_training._TINY_ARM_STATUS) == tiny_arms
+    assert all(tiny_training._TINY_ARM_STATUS.values())
+    supported = {
+        arm_id
+        for arm_id, status in tiny_training._TINY_ARM_STATUS.items()
+        if status == "supported"
+    }
+    assert supported == tiny_arms - {
+        "exact_cache.rotation_factorial",
+        "exact_cache.r_out_factorial",
+    }
+
+
+def test_tiny_dispatcher_rejects_unknown_runtime_and_arm_config_mismatch(
+    tmp_path: Path,
+) -> None:
+    runtime = _dispatcher_runtime(tmp_path)
+    runtime["device"] = "cpu"
+    with pytest.raises(TinyRuntimeConfigurationError) as runtime_error:
+        build_job_dispatcher(runtime)
+    assert runtime_error.value.code == "runtime_configuration_invalid"
+
+    native = _dispatcher_job()
+    mismatched = build_job(
+        native["canonical_config"],
+        seed=native["seed"],
+        stage=native["stage"],
+        backend="tiny",
+        arm_id="trapezoid",
+    )
+    with pytest.raises(TinyRuntimeConfigurationError) as arm_error:
+        build_job_dispatcher(_dispatcher_runtime(tmp_path))(mismatched)
+    assert arm_error.value.code == "arm_configuration_mismatch"
+
+
+def test_tiny_cache_payload_has_exactly_every_required_measured_field(
+    tmp_path: Path,
+) -> None:
+    job = _dispatcher_job(
+        "exact_cache.selector.exact_outer", task="mqar", params={"width": 4}
+    )
+    payload = build_job_dispatcher(_dispatcher_runtime(tmp_path))(job)
+    assert _EXACT_CACHE_FIELDS <= set(payload["exact_cache"])
+
+
+def test_tiny_dispatcher_translates_forced_oom_and_nonfinite_gradient(
+    tmp_path: Path,
+) -> None:
+    job = _dispatcher_job()
+
+    def out_of_memory(*_args, **_kwargs):
+        raise torch.OutOfMemoryError("injected tiny OOM")
+
+    with pytest.raises(ForcedOOM, match="injected tiny OOM") as oom:
+        build_job_dispatcher(
+            _dispatcher_runtime(tmp_path), dependencies={"build_model": out_of_memory}
+        )(job)
+    assert oom.value.phase == "model_initialization"
+    assert oom.value.context["device"] == "cpu"
+
+    def nonfinite_trainer(model, config):
+        trainer = TinyTrainer(model, config)
+
+        def fail(_episode):
+            raise FloatingPointError("training gradients are not finite")
+
+        trainer.train_step = fail  # type: ignore[method-assign]
+        return trainer
+
+    with pytest.raises(NonFiniteGradient, match="gradients"):
+        build_job_dispatcher(
+            _dispatcher_runtime(tmp_path),
+            dependencies={"build_trainer": nonfinite_trainer},
+        )(job)
+
+
+def test_tiny_dispatcher_integrates_with_execute_jobs_and_resume_skip(
+    tmp_path: Path,
+) -> None:
+    job = _dispatcher_job()
+    provenance = _provenance_for(job)
+    store = ResultStore(
+        tmp_path / "results", provenance=provenance, job_index=0, num_jobs=1
+    )
+    dispatcher = build_job_dispatcher(_dispatcher_runtime(tmp_path / "runtime"))
+    completed = execute_jobs(
+        [job],
+        store=store,
+        command=["python", "run"],
+        dispatchers={"tiny": dispatcher},
+        resume=True,
+    )
+    assert completed == [{"job_id": job["job_id"], "status": "completed"}]
+    skipped = execute_jobs(
+        [job],
+        store=store,
+        command=["python", "run"],
+        dispatchers={"tiny": dispatcher},
+        resume=True,
+    )
+    assert skipped == [{"job_id": job["job_id"], "status": "skipped"}]
+
+
+def test_tiny_dispatcher_translates_complete_current_native_baseline(
+    tmp_path: Path,
+) -> None:
+    captured: list[TinyKMD2Config] = []
+
+    def build_model(config: TinyKMD2Config, *, init_seed: int):
+        captured.append(config)
+        return TinyKMD2Model(config, init_seed=init_seed)
+
+    build_job_dispatcher(
+        _dispatcher_runtime(tmp_path), dependencies={"build_model": build_model}
+    )(_dispatcher_job())
+    assert len(captured) == 1
+    translated = captured[0]
+    assert translated.rotation_mode == "current"
+    assert translated.rotation_gate_init == 1.0
+    assert translated.convolution_gate_init == 1.0
+    assert translated.channel_decay_gate_init == 1.0
+    assert translated.write_offset_gate_init == 1.0
+
+
+def test_tiny_dispatcher_accepts_matched_native_job_for_treatment_config(
+    tmp_path: Path,
+) -> None:
+    treatment = _dispatcher_job(
+        "exact_cache.selector.exact_outer",
+        task="mqar",
+        params={"width": 4},
+    )
+    raw = copy.deepcopy(treatment["canonical_config"])
+    raw["runtime"] = {"output_path": "ignored", "device_ordinal": 0}
+    config = ExperimentConfig.from_dict(raw)
+    native = build_job(
+        config,
+        seed=treatment["seed"],
+        stage=treatment["stage"],
+        backend="tiny",
+        arm_id="native",
+        pairing_id="matched-native-pair",
+    )
+
+    payload = build_job_dispatcher(_dispatcher_runtime(tmp_path))(native)
+
+    assert "exact_cache" not in payload
+    assert payload["metrics"]
+    assert payload["recurrent_state"]["bytes"] > 0
+
+
+@pytest.mark.parametrize(
+    ("configured_arm", "paired_arm", "task", "params"),
+    [
+        ("rotation.current", "rotation.off", "parity", {}),
+        ("rotation.off", "rotation.current", "parity", {}),
+        ("convolution.on", "convolution.off", "mqar", {"width": 4}),
+        ("convolution.off", "convolution.on", "mqar", {"width": 4}),
+    ],
+)
+def test_tiny_dispatcher_accepts_matched_reliance_counterpart_job(
+    configured_arm: str,
+    paired_arm: str,
+    task: str,
+    params: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    configured = _dispatcher_job(configured_arm, task=task, params=params)
+    raw = copy.deepcopy(configured["canonical_config"])
+    raw["runtime"] = {"output_path": "ignored", "device_ordinal": 0}
+    config = ExperimentConfig.from_dict(raw)
+    counterpart = build_job(
+        config,
+        seed=configured["seed"],
+        stage=configured["stage"],
+        backend="tiny",
+        arm_id=paired_arm,
+        pairing_id="matched-reliance-pair",
+    )
+
+    payload = build_job_dispatcher(_dispatcher_runtime(tmp_path))(counterpart)
+
+    assert payload["metrics"]
+    assert payload["recurrent_state"]["bytes"] > 0
+
+
+def test_tiny_dispatcher_uses_explicit_true_mimo_rank_and_parameter_match(
+    tmp_path: Path,
+) -> None:
+    job = _dispatcher_job(
+        "true_mimo.sweep",
+        task="mqar",
+        params={
+            "width": 4,
+            "mimo_rank": 2,
+            "parameter_match_target": {
+                "state_key_dim": 2,
+                "state_value_dim": 2,
+                "mimo_rank": 1,
+            },
+        },
+    )
+    captured: list[TinyKMD2Config] = []
+
+    def build_model(config: TinyKMD2Config, *, init_seed: int):
+        captured.append(config)
+        return TinyKMD2Model(config, init_seed=init_seed)
+
+    payload = build_job_dispatcher(
+        _dispatcher_runtime(tmp_path), dependencies={"build_model": build_model}
+    )(job)
+    assert captured[0].mimo_rank == 2
+    assert captured[0].r_out == 1
+    assert captured[0].cache is None
+    assert payload["parameters"]["trainable"] == sum(
+        parameter.numel()
+        for parameter in TinyKMD2Model(captured[0], init_seed=211).parameters()
+        if parameter.requires_grad
+    )
+
+
+def test_matched_native_state_size_comparator_uses_declared_target_dimensions(
+    tmp_path: Path,
+) -> None:
+    raw = minimal_config_dict()
+    raw.update(
+        backend="tiny",
+        mechanism="state_size",
+        variant="state_size_sweep",
+        seeds=[211],
+        required_stage="mechanism_screen",
+    )
+    raw["task"] = {
+        "name": "mqar",
+        "params": {
+            "width": 4,
+            "parameter_match_target": {
+                "state_key_dim": 2,
+                "state_value_dim": 2,
+                "mimo_rank": 1,
+            },
+        },
+    }
+    raw["budget"] = {"tokens": 28, "updates": 2}
+    raw["schedule"]["warmup_updates"] = 1
+    raw["model"] = {
+        "hidden_size": 8,
+        "num_layers": 1,
+        "num_heads": 1,
+        "state_key_dim": 4,
+        "state_value_dim": 2,
+        "ffn_dim": 16,
+        "ffn_match_lower": 8,
+        "ffn_match_upper": 24,
+    }
+    raw["lengths"] = {"curriculum": [4], "extrapolation": [8, 16]}
+    raw["device_preferences"] = ["cpu"]
+    raw["dtype_preferences"] = ["float32"]
+    config = ExperimentConfig.from_dict(raw)
+    native = build_job(
+        config,
+        seed=211,
+        stage="mechanism_screen",
+        backend="tiny",
+        arm_id="native",
+        pairing_id="state-size-pair",
+    )
+    captured: list[TinyKMD2Config] = []
+
+    def build_model(model_config: TinyKMD2Config, *, init_seed: int):
+        captured.append(model_config)
+        return TinyKMD2Model(model_config, init_seed=init_seed)
+
+    build_job_dispatcher(
+        _dispatcher_runtime(tmp_path), dependencies={"build_model": build_model}
+    )(native)
+
+    assert len(captured) == 1
+    assert (captured[0].dk, captured[0].dv, captured[0].mimo_rank) == (2, 2, 1)
+
+
+def test_tiny_cache_off_and_current_block_controls_emit_honest_diagnostics(
+    tmp_path: Path,
+) -> None:
+    off_job = _dispatcher_job("exact_cache.off", task="mqar", params={"width": 4})
+    off = build_job_dispatcher(_dispatcher_runtime(tmp_path / "off"))(off_job)
+    assert off["exact_cache"]["amplitude_initial"] == [0.0]
+    assert off["exact_cache"]["amplitude_final"] == [0.0]
+    assert off["exact_cache"]["retention_count"] == 0
+    assert off["exact_cache"]["eviction_count"] == 0
+    assert off["exact_cache"]["persistent_bytes"] == 0
+    assert off["exact_cache"]["block_bytes"] == 0
+    assert off["exact_cache"]["implementation_paths"] == {
+        "scan": "tiny_backend.TinyKMD2Cell._forward_fp32",
+        "score": "tiny_backend.TinyKMD2Cell._forward_fp32.native_score",
+        "selection": "disabled_no_cache",
+        "read": "disabled_no_cache",
+    }
+    build_completed_record(
+        off_job,
+        _provenance_for(off_job),
+        shard_index=0,
+        num_jobs=1,
+        command=["python", "run"],
+        payload=off,
+    )
+
+    block_job = _dispatcher_job(
+        "exact_cache.current_block_only", task="mqar", params={"width": 4}
+    )
+    block = build_job_dispatcher(_dispatcher_runtime(tmp_path / "block"))(block_job)
+    assert block["exact_cache"]["width"] == 0
+    assert block["exact_cache"]["retention_count"] == 0
+    assert block["exact_cache"]["eviction_count"] > 0
+    assert block["exact_cache"]["persistent_bytes"] == 0
+
+
+def test_tiny_warm_start_arm_copies_every_shape_compatible_native_tensor(
+    tmp_path: Path,
+) -> None:
+    snapshots: list[tuple[TinyKMD2Config, dict[str, torch.Tensor]]] = []
+
+    def build_trainer(model: TinyKMD2Model, config: TinyTrainingConfig):
+        snapshots.append(
+            (
+                model.config,
+                {name: value.detach().clone() for name, value in model.state_dict().items()},
+            )
+        )
+        return TinyTrainer(model, config)
+
+    job = _dispatcher_job("trapezoid", task="irregular_integration", params={})
+    build_job_dispatcher(
+        _dispatcher_runtime(tmp_path), dependencies={"build_trainer": build_trainer}
+    )(job)
+    arm_config, arm_state = snapshots[0]
+    native_config = replace(arm_config, trapezoid=False)
+    native_state = TinyKMD2Model(native_config, init_seed=211).state_dict()
+    common = set(arm_state) & set(native_state)
+    assert common
+    assert all(
+        arm_state[name].shape != native_state[name].shape
+        or torch.equal(arm_state[name], native_state[name])
+        for name in common
     )
 
 

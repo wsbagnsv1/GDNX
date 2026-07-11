@@ -117,6 +117,16 @@ def minimal_config_dict() -> dict:
     }
 
 
+def test_every_committed_ablation_config_parses_as_complete_schema() -> None:
+    config_dir = Path(__file__).resolve().parents[2] / "research" / "kmd2_ablation" / "configs"
+    paths = sorted(config_dir.glob("*.json"))
+    assert paths, "no committed ablation configs found"
+    for path in paths:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        config = _config_module().ExperimentConfig.from_dict(raw)
+        assert config.semantic_dict()
+
+
 def _config_module():
     try:
         module = importlib.import_module("research.kmd2_ablation.config")

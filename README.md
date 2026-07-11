@@ -11,6 +11,15 @@
 
 ---
 
+## Current KMD-2 entry points
+
+The canonical training program is [`train/train_gdn3_distill.py`](train/train_gdn3_distill.py).
+The portable preregistered ablation and exact-cache workflow is documented at
+[`research/kmd2_ablation/README.md`](research/kmd2_ablation/README.md). It
+includes CPU Tiny screens and asset-gated Qwen paired-heal runs; this repository
+does not claim unrun ablations as results or support streaming exact-cache
+decode.
+
 ## What's Included
 
 ```

@@ -2,12 +2,232 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass
 
 import torch
 
 from .config import CacheConfig
+
+
+_ADMISSION_POLICIES = frozenset(
+    {
+        "exact_outer",
+        "coupled_paper",
+        "residual_only",
+        "write_value",
+        "recency",
+        "reservoir",
+        "future_query_oracle",
+    }
+)
+
+
+class AdmissionScoreError(ValueError):
+    """A stable typed admission-score contract violation."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(f"{code}: {message}")
+
+
+def _fp32_vector_norm(value: torch.Tensor) -> torch.Tensor:
+    """Return the ordinary fp32 norm with an fp32-only underflow fallback."""
+
+    norm = torch.linalg.vector_norm(value, dim=-1)
+    scale = value.abs().amax(dim=-1)
+    safe_scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+    scaled_norm = scale * torch.linalg.vector_norm(
+        value / safe_scale.unsqueeze(-1), dim=-1
+    )
+    return torch.where((norm == 0) & (scale > 0), scaled_norm, norm)
+
+
+@torch.autocast(device_type="cuda", enabled=False)
+@torch.autocast(device_type="cpu", enabled=False)
+def admission_scores(
+    *,
+    policy: str,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    memory: torch.Tensor,
+    beta_e: torch.Tensor,
+    beta_w: torch.Tensor,
+    positions: torch.Tensor,
+    valid: torch.Tensor,
+    selector_seed: int | None,
+    future_relevance: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return detached fp32 per-token/head priorities for one declared policy."""
+
+    if type(policy) is not str:
+        raise AdmissionScoreError("type_invalid", "policy must be a string")
+    if policy not in _ADMISSION_POLICIES:
+        raise AdmissionScoreError(
+            "policy_invalid",
+            "policy must be one of: " + ", ".join(sorted(_ADMISSION_POLICIES)),
+        )
+    named = {"key": key, "value": value, "memory": memory}
+    if any(not isinstance(tensor, torch.Tensor) for tensor in named.values()):
+        raise AdmissionScoreError(
+            "type_invalid", "key, value, and memory must be tensors"
+        )
+    if key.ndim != 4 or value.ndim != 4 or memory.shape != value.shape:
+        raise AdmissionScoreError(
+            "shape_invalid", "key/value/memory must have shape [B,T,H,D]"
+        )
+    batch, steps, heads, key_dim = key.shape
+    if min(batch, steps, heads, key_dim, value.shape[-1]) < 1:
+        raise AdmissionScoreError("shape_invalid", "tensor dimensions must be positive")
+    if value.shape[:3] != (batch, steps, heads):
+        raise AdmissionScoreError(
+            "shape_invalid", "key/value/memory leading dimensions must match"
+        )
+    if not isinstance(beta_e, torch.Tensor) or not isinstance(beta_w, torch.Tensor):
+        raise AdmissionScoreError("type_invalid", "beta_e and beta_w must be tensors")
+    if beta_e.shape != (batch, steps, heads) or beta_w.shape != beta_e.shape:
+        raise AdmissionScoreError(
+            "shape_invalid", "beta_e and beta_w must have shape [B,T,H]"
+        )
+    if (
+        not isinstance(positions, torch.Tensor)
+        or positions.dtype != torch.int64
+        or positions.shape != (batch, steps)
+        or not isinstance(valid, torch.Tensor)
+        or valid.dtype != torch.bool
+        or valid.shape != (batch, steps)
+    ):
+        raise AdmissionScoreError(
+            "shape_invalid",
+            "positions must be int64 and valid bool with shape [B,T]",
+        )
+    tensors = (key, value, memory, beta_e, beta_w, positions, valid)
+    if len({tensor.device for tensor in tensors}) != 1:
+        raise AdmissionScoreError("device_invalid", "all operands must share a device")
+    if any(not tensor.is_floating_point() for tensor in (key, value, memory, beta_e, beta_w)):
+        raise AdmissionScoreError("dtype_invalid", "score operands must be floating point")
+    expanded_valid = valid.unsqueeze(-1).expand(batch, steps, heads)
+    for name, tensor in (
+        ("key", key),
+        ("value", value),
+        ("memory", memory),
+        ("beta_e", beta_e),
+        ("beta_w", beta_w),
+    ):
+        mask = expanded_valid.unsqueeze(-1).expand_as(tensor) if tensor.ndim == 4 else expanded_valid
+        if not bool(torch.isfinite(tensor.detach()[mask]).all()):
+            raise AdmissionScoreError(
+                "nonfinite_input", f"{name} must be finite at valid positions"
+            )
+    for name, gate in (("beta_e", beta_e), ("beta_w", beta_w)):
+        selected = gate.detach()[expanded_valid]
+        if bool(((selected < 0) | (selected > 1)).any()):
+            raise AdmissionScoreError(
+                "gate_invalid", f"{name} must lie in [0,1] at valid positions"
+            )
+    if bool((positions[valid] < 0).any()) or bool((positions[~valid] != -1).any()):
+        raise AdmissionScoreError(
+            "position_invalid", "positions must be nonnegative when valid and -1 otherwise"
+        )
+    if selector_seed is not None and type(selector_seed) is not int:
+        raise AdmissionScoreError("selector_seed_invalid", "selector_seed must be an int")
+    if policy == "reservoir" and selector_seed is None:
+        raise AdmissionScoreError(
+            "selector_seed_required", "reservoir policy requires selector_seed"
+        )
+    if policy == "future_query_oracle" and future_relevance is None:
+        raise AdmissionScoreError(
+            "future_relevance_required",
+            "future-query oracle requires explicit relevance annotations",
+        )
+
+    key_fp32 = key.float()
+    value_fp32 = value.float()
+    memory_fp32 = memory.float()
+    beta_e_fp32 = beta_e.float()
+    beta_w_fp32 = beta_w.float()
+    zero = torch.zeros((), dtype=torch.float32, device=key.device)
+    safe_key = torch.where(
+        expanded_valid.unsqueeze(-1), key_fp32, zero
+    )
+    safe_value = torch.where(
+        expanded_valid.unsqueeze(-1), value_fp32, zero
+    )
+    safe_memory = torch.where(
+        expanded_valid.unsqueeze(-1), memory_fp32, zero
+    )
+    safe_beta_e = torch.where(expanded_valid, beta_e_fp32, zero)
+    safe_beta_w = torch.where(expanded_valid, beta_w_fp32, zero)
+    key_norm = _fp32_vector_norm(safe_key)
+    if policy == "exact_outer":
+        update = safe_beta_w.unsqueeze(-1) * safe_value - safe_beta_e.unsqueeze(-1) * safe_memory
+        result = key_norm * _fp32_vector_norm(update)
+    elif policy == "coupled_paper":
+        result = (
+            key_norm
+            * safe_beta_w
+            * _fp32_vector_norm(safe_value - safe_memory)
+        )
+    elif policy == "residual_only":
+        result = key_norm * _fp32_vector_norm(safe_value - safe_memory)
+    elif policy == "write_value":
+        result = key_norm * safe_beta_w * _fp32_vector_norm(safe_value)
+    elif policy == "recency":
+        result = (
+            positions.float()
+            .clamp_min(0)
+            .unsqueeze(-1)
+            .expand(batch, steps, heads)
+        )
+    elif policy == "reservoir":
+        assert selector_seed is not None
+        values = torch.zeros(
+            batch, steps, heads, dtype=torch.float32, device=key.device
+        )
+        for batch_index in range(batch):
+            for token_index in range(steps):
+                for head_index in range(heads):
+                    if not bool(valid[batch_index, token_index]):
+                        continue
+                    material = (
+                        f"{selector_seed}:{batch_index}:{token_index}:{head_index}:"
+                        f"{int(positions[batch_index, token_index])}"
+                    ).encode("ascii")
+                    integer = int.from_bytes(hashlib.sha256(material).digest()[:3], "big")
+                    values[batch_index, token_index, head_index] = integer / 16777216.0
+        result = values
+    else:
+        assert future_relevance is not None
+        if not isinstance(future_relevance, torch.Tensor):
+            raise AdmissionScoreError(
+                "type_invalid", "future_relevance must be a tensor"
+            )
+        if future_relevance.shape == (batch, steps):
+            relevance = future_relevance.unsqueeze(-1).expand(batch, steps, heads)
+        elif future_relevance.shape == (batch, steps, heads):
+            relevance = future_relevance
+        else:
+            raise AdmissionScoreError(
+                "shape_invalid",
+                "future_relevance must have shape [B,T] or [B,T,H]",
+            )
+        if relevance.device != key.device:
+            raise AdmissionScoreError(
+                "device_invalid", "future_relevance must share the operand device"
+            )
+        if not (relevance.dtype == torch.bool or relevance.is_floating_point()):
+            raise AdmissionScoreError(
+                "dtype_invalid", "future_relevance must have bool or floating dtype"
+            )
+        selected = relevance.detach()[expanded_valid]
+        if not bool(torch.isfinite(selected.float()).all()) or bool((selected < 0).any()):
+            raise AdmissionScoreError(
+                "future_relevance_invalid",
+                "future_relevance must be finite and nonnegative at valid positions",
+            )
+        result = relevance.float()
+    return torch.where(expanded_valid, result, torch.zeros_like(result)).detach()
 
 
 @dataclass(frozen=True)
@@ -133,6 +353,8 @@ class ExactCacheState:
         if self.scores.requires_grad or self.scores.grad_fn is not None:
             raise ValueError("scores must be detached")
         detached_valid = self.valid.detach()
+        if bool((self.positions.detach()[detached_valid] < 0).any()):
+            raise ValueError("positions must be nonnegative at every valid cache slot")
         for name, tensor in (("keys", self.keys), ("values", self.values)):
             if not bool(torch.isfinite(tensor.detach()[detached_valid]).all()):
                 raise ValueError(f"{name} must be finite at every valid cache slot")
@@ -341,6 +563,10 @@ def _validate_merge_inputs(
             raise ValueError("state and completed-block tensors must share a device")
 
     detached_valid = block_valid.detach()
+    if bool((block_positions.detach()[detached_valid] < 0).any()):
+        raise ValueError(
+            "block_positions must be nonnegative at every valid block position"
+        )
     for name, tensor in (("block_k", block_k), ("block_v", block_v)):
         if not bool(torch.isfinite(tensor.detach()[detached_valid]).all()):
             raise ValueError(f"{name} must be finite at every valid block position")
@@ -609,13 +835,25 @@ def _validate_cache_read_inputs(
     if len(devices) != 1:
         raise ValueError("all cache-read tensors must share a device")
     device = q_eff.device
+    detached_query_positions = query_positions.detach()
+    detached_block_positions = block_positions.detach()
+    detached_block_valid = block_valid.detach()
+    if bool((detached_query_positions < 0).any()):
+        raise ValueError("query_positions must be nonnegative")
+    if bool((detached_block_positions[detached_block_valid] < 0).any()):
+        raise ValueError(
+            "block_positions must be nonnegative at every valid block position"
+        )
 
     if block_length > 0:
         if block_length != steps:
             raise ValueError(
                 "current block length must equal query steps when the block is nonempty"
             )
-        if not torch.equal(block_positions.detach(), query_positions.detach()):
+        if not torch.equal(
+            detached_block_positions[detached_block_valid],
+            detached_query_positions[detached_block_valid],
+        ):
             raise ValueError(
                 "block_positions must exactly equal query_positions for a nonempty current block"
             )

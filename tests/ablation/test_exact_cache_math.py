@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+import math
+import os
 import subprocess
 import sys
 import textwrap
@@ -10,12 +12,324 @@ import pytest
 import torch
 
 from research.kmd2_ablation.exact_cache import (
+    AdmissionScoreError,
+    admission_scores,
     deterministic_topw,
     reference_scan_with_scores,
 )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _fp32_reference_norm(value: torch.Tensor) -> torch.Tensor:
+    ordinary = torch.linalg.vector_norm(value, dim=-1)
+    scale = value.abs().amax(dim=-1)
+    safe_scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+    scaled = scale * torch.linalg.vector_norm(
+        value / safe_scale.unsqueeze(-1), dim=-1
+    )
+    return torch.where((ordinary == 0) & (scale > 0), scaled, ordinary)
+
+
+@pytest.fixture
+def admission_operands() -> dict[str, torch.Tensor]:
+    return {
+        "key": torch.tensor(
+            [[[[3.0, 4.0], [0.0, 2.0]], [[1.0e-30, 0.0], [1.0, 0.0]]]],
+            dtype=torch.float64,
+            requires_grad=True,
+        ),
+        "value": torch.tensor(
+            [[[[2.0, -1.0], [4.0, 3.0]], [[5.0, 2.0], [2.0, 6.0]]]],
+            dtype=torch.float64,
+            requires_grad=True,
+        ),
+        "memory": torch.tensor(
+            [[[[1.0, 3.0], [2.0, -1.0]], [[7.0, 1.0], [-2.0, 4.0]]]],
+            dtype=torch.float64,
+            requires_grad=True,
+        ),
+        "beta_e": torch.tensor(
+            [[[0.25, 0.75], [1.0, 0.0]]], dtype=torch.float64, requires_grad=True
+        ),
+        "beta_w": torch.tensor(
+            [[[0.5, 0.125], [0.0, 1.0]]], dtype=torch.float64, requires_grad=True
+        ),
+        "positions": torch.tensor([[0, 7]], dtype=torch.int64),
+        "valid": torch.tensor([[True, True]]),
+    }
+
+
+@pytest.mark.parametrize(
+    ("policy", "formula"),
+    [
+        (
+            "exact_outer",
+            lambda k, v, m, be, bw: _fp32_reference_norm(k)
+            * _fp32_reference_norm(
+                bw.unsqueeze(-1) * v - be.unsqueeze(-1) * m
+            ),
+        ),
+        (
+            "coupled_paper",
+            lambda k, v, m, _be, bw: _fp32_reference_norm(k)
+            * bw
+            * _fp32_reference_norm(v - m),
+        ),
+        (
+            "residual_only",
+            lambda k, v, m, _be, _bw: _fp32_reference_norm(k)
+            * _fp32_reference_norm(v - m),
+        ),
+        (
+            "write_value",
+            lambda k, v, _m, _be, bw: _fp32_reference_norm(k)
+            * bw
+            * _fp32_reference_norm(v),
+        ),
+    ],
+)
+def test_admission_score_formulas_match_fp32_references_exactly(
+    admission_operands: dict[str, torch.Tensor], policy: str, formula: Callable
+) -> None:
+    actual = admission_scores(policy=policy, selector_seed=37, **admission_operands)
+    expected = formula(
+        admission_operands["key"].float(),
+        admission_operands["value"].float(),
+        admission_operands["memory"].float(),
+        admission_operands["beta_e"].float(),
+        admission_operands["beta_w"].float(),
+    )
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+    assert torch.isfinite(actual).all()
+    assert not actual.requires_grad and actual.grad_fn is None
+
+
+def test_bf16_admission_arithmetic_matches_fp32_and_preserves_topk_survivor() -> None:
+    key = torch.tensor(
+        [[[[-3.15625, -1.4140625]], [[1.6796875, 0.96875]]]],
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    value = torch.tensor(
+        [[[[-1.2109375, 1.875]], [[1.875, 1.421875]]]],
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    memory = torch.tensor(
+        [[[[-1.015625, 0.09912109375]], [[-1.4375, 0.62890625]]]],
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    beta_e = torch.tensor(
+        [[[0.9296875], [0.05810546875]]],
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    beta_w = torch.tensor(
+        [[[0.55078125], [0.72265625]]],
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    source_dtype_scores = (
+        torch.linalg.vector_norm(key, dim=-1)
+        * torch.linalg.vector_norm(
+            beta_w.unsqueeze(-1) * value - beta_e.unsqueeze(-1) * memory,
+            dim=-1,
+        )
+    ).float()
+    fp32_scores = torch.linalg.vector_norm(key.float(), dim=-1) * torch.linalg.vector_norm(
+        beta_w.float().unsqueeze(-1) * value.float()
+        - beta_e.float().unsqueeze(-1) * memory.float(),
+        dim=-1,
+    )
+    assert source_dtype_scores.argmax(dim=1).item() == 1
+    assert fp32_scores.argmax(dim=1).item() == 0
+
+    actual = admission_scores(
+        policy="exact_outer",
+        key=key,
+        value=value,
+        memory=memory,
+        beta_e=beta_e,
+        beta_w=beta_w,
+        positions=torch.tensor([[0, 1]], dtype=torch.int64),
+        valid=torch.ones(1, 2, dtype=torch.bool),
+        selector_seed=0,
+    )
+
+    torch.testing.assert_close(actual, fp32_scores, atol=0.0, rtol=0.0)
+    assert actual.argmax(dim=1).item() == 0
+    assert actual.dtype == torch.float32
+    assert not actual.requires_grad and actual.grad_fn is None
+
+
+def test_admission_scores_preserve_zero_and_subepsilon_key_factors(
+    admission_operands: dict[str, torch.Tensor],
+) -> None:
+    operands = dict(admission_operands)
+    operands["key"] = torch.tensor(
+        [[[[0.0, 0.0]], [[1.0e-30, 0.0]]]], dtype=torch.float64
+    )
+    operands["value"] = torch.ones(1, 2, 1, 2, dtype=torch.float64)
+    operands["memory"] = torch.zeros_like(operands["value"])
+    operands["beta_e"] = torch.ones(1, 2, 1, dtype=torch.float64)
+    operands["beta_w"] = torch.ones(1, 2, 1, dtype=torch.float64)
+    actual = admission_scores(policy="exact_outer", selector_seed=1, **operands)
+    assert actual[0, 0, 0].item() == 0.0
+    assert actual[0, 1, 0].item() == pytest.approx(
+        math.sqrt(2.0) * 1.0e-30, rel=1.0e-6, abs=0.0
+    )
+
+
+def test_recency_reservoir_and_future_oracle_priorities_are_explicit_and_stable(
+    admission_operands: dict[str, torch.Tensor],
+) -> None:
+    recency = admission_scores(
+        policy="recency", selector_seed=19, **admission_operands
+    )
+    assert torch.equal(recency[0, :, 0], torch.tensor([0.0, 7.0]))
+    assert torch.equal(recency[..., 0], recency[..., 1])
+
+    first = admission_scores(
+        policy="reservoir", selector_seed=9127, **admission_operands
+    )
+    admission_scores(policy="reservoir", selector_seed=5, **admission_operands)
+    repeated = admission_scores(
+        policy="reservoir", selector_seed=9127, **admission_operands
+    )
+    assert torch.equal(first, repeated)
+    assert torch.all((first >= 0) & (first < 1))
+    assert not torch.equal(first[..., 0], first[..., 1])
+
+    relevance = torch.tensor([[[3.0, 0.0], [0.0, 2.0]]])
+    oracle = admission_scores(
+        policy="future_query_oracle",
+        selector_seed=0,
+        future_relevance=relevance,
+        **admission_operands,
+    )
+    assert torch.equal(oracle, relevance.float())
+    assert oracle[0, 0, 0] > oracle[0, 1, 0]
+
+
+def test_reservoir_priority_is_invariant_to_python_hash_seed() -> None:
+    script = textwrap.dedent(
+        """
+        import json
+        import torch
+        from research.kmd2_ablation.exact_cache import admission_scores
+        shape = (2, 4, 3)
+        zeros = torch.zeros(*shape, 2)
+        result = admission_scores(
+            policy="reservoir",
+            key=zeros,
+            value=zeros,
+            memory=zeros,
+            beta_e=torch.zeros(shape),
+            beta_w=torch.zeros(shape),
+            positions=torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]]),
+            valid=torch.ones(2, 4, dtype=torch.bool),
+            selector_seed=551,
+        )
+        print(json.dumps(result.tolist(), separators=(",", ":")))
+        """
+    )
+    outputs = []
+    for hash_seed in ("1", "999"):
+        environment = dict(os.environ)
+        environment["PYTHONHASHSEED"] = hash_seed
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=REPO_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+        assert completed.returncode == 0, completed.stderr
+        outputs.append(completed.stdout)
+    assert outputs[0] == outputs[1]
+
+
+@pytest.mark.parametrize(
+    ("changes", "code"),
+    [
+        ({"policy": "unknown"}, "policy_invalid"),
+        ({"selector_seed": None, "policy": "reservoir"}, "selector_seed_required"),
+        (
+            {"policy": "future_query_oracle", "future_relevance": None},
+            "future_relevance_required",
+        ),
+        ({"positions": torch.zeros(1, 3, dtype=torch.int64)}, "shape_invalid"),
+    ],
+)
+def test_admission_score_validation_is_typed(
+    admission_operands: dict[str, torch.Tensor],
+    changes: dict[str, object],
+    code: str,
+) -> None:
+    arguments: dict[str, object] = {
+        "policy": "exact_outer",
+        "selector_seed": 3,
+        **admission_operands,
+    }
+    arguments.update(changes)
+    with pytest.raises(AdmissionScoreError) as caught:
+        admission_scores(**arguments)
+    assert caught.value.code == code
+
+
+@pytest.mark.parametrize("policy", [[], {}, 7, None])
+def test_admission_score_policy_type_validation_is_always_typed(
+    admission_operands: dict[str, torch.Tensor], policy: object
+) -> None:
+    with pytest.raises(AdmissionScoreError) as caught:
+        admission_scores(
+            policy=policy,  # type: ignore[arg-type]
+            selector_seed=3,
+            **admission_operands,
+        )
+    assert caught.value.code == "type_invalid"
+
+
+@pytest.mark.parametrize(
+    ("future_relevance", "code"),
+    [
+        pytest.param([[1.0, 0.0]], "type_invalid", id="non-tensor"),
+        pytest.param(
+            torch.tensor([[1, 0]], dtype=torch.int64),
+            "dtype_invalid",
+            id="wrong-dtype",
+        ),
+        pytest.param(
+            torch.ones(1, 2, 1, 1),
+            "shape_invalid",
+            id="wrong-shape",
+        ),
+        pytest.param(
+            torch.tensor([[float("nan"), 0.0]]),
+            "future_relevance_invalid",
+            id="nonfinite",
+        ),
+    ],
+)
+def test_future_oracle_relevance_validation_is_always_typed(
+    admission_operands: dict[str, torch.Tensor],
+    future_relevance: object,
+    code: str,
+) -> None:
+    with pytest.raises(AdmissionScoreError) as caught:
+        admission_scores(
+            policy="future_query_oracle",
+            selector_seed=3,
+            future_relevance=future_relevance,  # type: ignore[arg-type]
+            **admission_operands,
+        )
+    assert caught.value.code == code
 
 
 def test_exact_cache_import_isolated_from_optional_acceleration_dependencies() -> None:

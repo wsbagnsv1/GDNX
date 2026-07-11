@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import inspect
 import math
 import subprocess
 import sys
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
+from typing import get_args, get_type_hints
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+import research.kmd2_ablation.tiny_backend as tiny_backend_module
 from research.kmd2_ablation.config import CacheConfig
 from research.kmd2_ablation.tasks import generate_task
 from research.kmd2_ablation.tiny_backend import (
@@ -20,6 +23,7 @@ from research.kmd2_ablation.tiny_backend import (
     TinyKMD2Config,
     TinyKMD2Model,
     TinyModelOutput,
+    future_query_relevance,
     tiny_factors_from_episode,
 )
 
@@ -142,8 +146,9 @@ def test_tiny_api_shapes_and_validation() -> None:
     mimo_config = _config(mimo_rank=2)
     mimo_factors = _factors(q_slots=2, write_slots=2, dv=3)
     assert mimo_factors.q.shape[3] == mimo_factors.k.shape[3] == 2
-    with pytest.raises(NotImplementedError, match="true MIMO requires Task 9"):
-        TinyKMD2Cell(mimo_config)(mimo_factors)
+    mimo_output = TinyKMD2Cell(mimo_config)(mimo_factors)
+    assert mimo_output.read.shape == (1, 3, 1, 3)
+    assert torch.isfinite(mimo_output.read).all()
 
 
 @pytest.mark.parametrize(
@@ -157,25 +162,357 @@ def test_tiny_api_shapes_and_validation() -> None:
         "future_query_oracle",
     ],
 )
-def test_tiny_api_rejects_unimplemented_cache_score_modes(score: str) -> None:
-    with pytest.raises(NotImplementedError, match="exact_outer.*Task 9"):
-        _config(cache=CacheConfig(score=score))
+def test_tiny_cache_score_modes_execute_without_changing_recurrence(score: str) -> None:
+    factors = _factors(steps=6, dk=2, dv=2)
+    native = TinyKMD2Cell(_config(dv=2))(factors)
+    cell = TinyKMD2Cell(
+        _config(
+            dv=2,
+            selector_seed=317,
+            cache=CacheConfig(
+                width=2,
+                block_size=2,
+                score=score,
+                storage_dtype="fp32",
+            ),
+        )
+    )
+    future_relevance = None
+    if score == "future_query_oracle":
+        future_relevance = torch.tensor([[5.0, 0.0, 0.0, 0.0, 1.0, 0.0]])
+    output = cell(factors, future_relevance=future_relevance)
+    assert torch.equal(output.state_read, native.state_read)
+    assert torch.equal(output.final_state, native.final_state)
+    assert torch.isfinite(output.scores).all()
+    assert output.scores.dtype == torch.float32
+    assert output.selected_positions.shape == (1, 1, 2)
+    if score == "recency":
+        assert set(output.selected_positions.flatten().tolist()) == {4, 5}
+    if score == "future_query_oracle":
+        assert 0 in output.selected_positions.flatten().tolist()
 
 
-@pytest.mark.parametrize(
-    "cache",
-    [
-        CacheConfig(
-            coordinate_frame="pre_rotation", pre_rotation_diagnostic=True
-        ),
-        CacheConfig(pre_rotation_diagnostic=True),
-    ],
-)
-def test_tiny_api_rejects_unimplemented_pre_rotation_cache_frame(
-    cache: CacheConfig,
+def test_tiny_reservoir_selector_is_seeded_and_call_order_independent() -> None:
+    factors = _factors(steps=12, dk=2, dv=1)
+
+    def selected(seed: int) -> torch.Tensor:
+        config = _config(
+            dv=1,
+            selector_seed=seed,
+            cache=CacheConfig(
+                width=3, block_size=2, score="reservoir", storage_dtype="fp32"
+            ),
+        )
+        return TinyKMD2Cell(config)(factors).selected_positions
+
+    first = selected(919)
+    selected(7)
+    assert torch.equal(first, selected(919))
+    assert not torch.equal(first, selected(920))
+
+
+def test_tiny_unbounded_cache_retains_every_entry_without_eviction() -> None:
+    factors = _factors(steps=9, dk=2, dv=1)
+    unbounded = TinyKMD2Cell(
+        _config(
+            dv=1,
+            unbounded_cache=True,
+            selector_seed=1,
+            cache=CacheConfig(
+                width=1, block_size=2, score="exact_outer", storage_dtype="fp32"
+            ),
+        )
+    )(factors)
+    bounded = TinyKMD2Cell(
+        _config(
+            dv=1,
+            selector_seed=1,
+            cache=CacheConfig(
+                width=9, block_size=2, score="exact_outer", storage_dtype="fp32"
+            ),
+        )
+    )(factors)
+    assert unbounded.selected_positions.shape == (1, 1, 9)
+    assert set(unbounded.selected_positions.flatten().tolist()) == set(range(9))
+    assert unbounded.eviction_count == 0
+    assert torch.equal(unbounded.cache_read, bounded.cache_read)
+    assert unbounded.cache_persistent_bytes == bounded.cache_persistent_bytes
+
+
+@pytest.mark.parametrize("unbounded_cache", [False, True])
+def test_cache_diagnostic_budget_is_checked_before_scan_for_every_cache(
+    unbounded_cache: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with pytest.raises(NotImplementedError, match="rotated_recurrence.*Task 9"):
-        _config(cache=cache)
+    estimator = tiny_backend_module._cache_diagnostic_allocation_bytes
+    assert {"cache_width", "layers"} <= set(inspect.signature(estimator).parameters)
+    steps = 4
+    declared_width = 2
+    cache_width = steps if unbounded_cache else declared_width
+    estimated_bytes = estimator(
+        batch=1,
+        steps=steps,
+        heads=1,
+        query_slots=1,
+        value_dim=1,
+        cache_width=cache_width,
+        block_size=2,
+        per_slot_read=False,
+        layers=3,
+    )
+    budget = estimated_bytes - 1
+    assert hasattr(tiny_backend_module, "_MAX_CACHE_DIAGNOSTIC_BYTES")
+    monkeypatch.setattr(tiny_backend_module, "_MAX_CACHE_DIAGNOSTIC_BYTES", budget)
+    cell = TinyKMD2Cell(
+        _config(
+            dv=1,
+            layers=3,
+            unbounded_cache=unbounded_cache,
+            cache=CacheConfig(
+                width=declared_width, block_size=2, storage_dtype="fp32"
+            ),
+        )
+    )
+    factors = _factors(steps=steps, dk=2, dv=1)
+
+    def unexpected_work(*args, **kwargs):
+        raise AssertionError("recurrent allocation/matmul began before the budget check")
+
+    monkeypatch.setattr(tiny_backend_module.torch, "zeros", unexpected_work)
+    monkeypatch.setattr(tiny_backend_module.torch, "matmul", unexpected_work)
+    with pytest.raises(tiny_backend_module.CacheDiagnosticBudgetError) as caught:
+        cell(factors)
+    assert caught.value.code == "diagnostic_budget_exceeded"
+    assert "cache diagnostics require" in str(caught.value)
+    assert "unbounded cache diagnostics" not in str(caught.value)
+    assert caught.value.context == {
+        "estimated_bytes": estimated_bytes,
+        "budget_bytes": budget,
+        "batch": 1,
+        "steps": steps,
+        "heads": 1,
+        "query_slots": 1,
+        "value_dim": 1,
+        "cache_width": cache_width,
+        "block_size": 2,
+        "per_slot_read": False,
+        "layers": 3,
+        "unbounded_cache": unbounded_cache,
+    }
+
+
+def test_cache_diagnostic_estimate_includes_layers_without_blocking_normal_profile() -> None:
+    estimator = tiny_backend_module._cache_diagnostic_allocation_bytes
+    assert {"cache_width", "layers"} <= set(inspect.signature(estimator).parameters)
+    common = {
+        "batch": 8,
+        "steps": 256,
+        "heads": 4,
+        "query_slots": 1,
+        "value_dim": 64,
+        "cache_width": 32,
+        "block_size": 64,
+        "per_slot_read": False,
+    }
+    one_layer = estimator(layers=1, **common)
+    four_layers = estimator(layers=4, **common)
+    assert four_layers == 4 * one_layer
+    assert four_layers < tiny_backend_module._MAX_CACHE_DIAGNOSTIC_BYTES
+
+
+def test_cache_diagnostic_estimator_preserves_unbounded_compatibility_defaults() -> None:
+    estimator = tiny_backend_module._cache_diagnostic_allocation_bytes
+    legacy = estimator(
+        batch=1,
+        steps=9,
+        heads=1,
+        query_slots=1,
+        value_dim=1,
+        block_size=2,
+        per_slot_read=False,
+    )
+    explicit = estimator(
+        batch=1,
+        steps=9,
+        heads=1,
+        query_slots=1,
+        value_dim=1,
+        cache_width=9,
+        block_size=2,
+        per_slot_read=False,
+        layers=1,
+    )
+    assert legacy == explicit
+
+
+def test_cache_forward_return_annotation_matches_runtime_arity() -> None:
+    annotation = get_type_hints(TinyKMD2Cell._cache_forward)["return"]
+    fields = get_args(annotation)
+    assert len(fields) == 20
+    assert fields[:16] == (torch.Tensor,) * 16
+    assert fields[16:] == (int,) * 4
+
+
+def test_future_query_oracle_derives_relevance_from_episode_source_spans() -> None:
+    episode = generate_task("mqar", 1, 4, 421, "train", {"width": 4})
+    relevance = future_query_relevance(episode)
+    assert relevance.shape == episode.valid.shape
+    assert relevance.dtype == torch.float32
+    expected = torch.zeros_like(relevance)
+    for query in torch.nonzero(episode.query_mask[0], as_tuple=False).flatten():
+        start, stop = episode.source_spans[0, query].tolist()
+        expected[0, start:stop] += 1.0
+    assert torch.equal(relevance, expected)
+
+    vocab_size = max(
+        int(episode.input_ids.max()), int(episode.targets[episode.loss_mask].max())
+    ) + 1
+    model = TinyKMD2Model(
+        TinyKMD2Config(
+            d_model=8,
+            heads=1,
+            dk=2,
+            dv=2,
+            layers=1,
+            vocab_size=vocab_size,
+            d_ff=16,
+            rotation_mode="none",
+            selector_seed=421,
+            cache=CacheConfig(
+                width=2,
+                block_size=2,
+                score="future_query_oracle",
+                storage_dtype="fp32",
+            ),
+        ),
+        init_seed=421,
+    )
+    output = model.forward_episode(episode)
+    selected = set(output.cell_outputs[0].selected_positions.flatten().tolist())
+    relevant_positions = set(torch.nonzero(relevance[0], as_tuple=False).flatten().tolist())
+    assert selected & relevant_positions
+
+
+def test_future_query_oracle_rejects_forward_without_annotations() -> None:
+    factors = _factors(steps=4, dk=2, dv=1)
+    cell = TinyKMD2Cell(
+        _config(
+            dv=1,
+            selector_seed=9,
+            cache=CacheConfig(
+                width=2,
+                block_size=2,
+                score="future_query_oracle",
+                storage_dtype="fp32",
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="future_relevance_required"):
+        cell(factors)
+
+
+def test_tiny_pre_rotation_cache_changes_only_cache_coordinates_and_read() -> None:
+    rotated_config = _config(
+        dk=4,
+        dv=2,
+        rotation_mode="current",
+        rotation_gate_init=1.0,
+        cache=CacheConfig(
+            width=2,
+            block_size=2,
+            coordinate_frame="rotated_recurrence",
+            storage_dtype="fp32",
+        ),
+    )
+    pre_config = replace(
+        rotated_config,
+        cache=CacheConfig(
+            width=2,
+            block_size=2,
+            coordinate_frame="pre_rotation",
+            pre_rotation_diagnostic=True,
+            storage_dtype="fp32",
+        ),
+    )
+    rotated_projector = TinyFactorProjector(rotated_config)
+    pre_projector = TinyFactorProjector(pre_config)
+    pre_projector.load_state_dict(rotated_projector.state_dict(), strict=True)
+    hidden = torch.randn(
+        1,
+        6,
+        rotated_config.d_model,
+        generator=torch.Generator().manual_seed(89),
+        requires_grad=True,
+    )
+    valid = torch.ones(1, 6, dtype=torch.bool)
+    positions = torch.arange(6).view(1, 6)
+    rotated_factors = rotated_projector(hidden, valid, positions)
+    pre_factors = pre_projector(hidden, valid, positions)
+    assert pre_factors.cache_q is not None and pre_factors.cache_k is not None
+    assert not torch.equal(pre_factors.cache_q, pre_factors.q)
+    assert not torch.equal(pre_factors.cache_k, pre_factors.k)
+    rotated_cell = TinyKMD2Cell(rotated_config)
+    pre_cell = TinyKMD2Cell(pre_config)
+    pre_cell.load_state_dict(rotated_cell.state_dict(), strict=True)
+    with torch.no_grad():
+        rotated_cell.cache_amplitude.fill_(1.0)
+        pre_cell.cache_amplitude.fill_(1.0)
+    rotated = rotated_cell(rotated_factors)
+    pre = pre_cell(pre_factors)
+    assert torch.equal(rotated.state_read, pre.state_read)
+    assert torch.equal(rotated.final_state, pre.final_state)
+    assert not torch.equal(rotated.cache_read, pre.cache_read)
+    loss = pre.cache_read.square().sum()
+    gradients = torch.autograd.grad(loss, (hidden, pre_projector.q_proj.weight), allow_unused=True)
+    assert all(gradient is not None and torch.isfinite(gradient).all() for gradient in gradients)
+
+
+def test_tiny_per_slot_cache_read_matches_r_out_one_and_combines_real_slots() -> None:
+    single = _factors(steps=5, dk=2, dv=2)
+    cache = CacheConfig(width=2, block_size=2, storage_dtype="fp32")
+    shared_one = TinyKMD2Cell(_config(dv=2, cache=cache))(single)
+    slot_one = TinyKMD2Cell(
+        _config(dv=2, cache=cache, per_slot_cache_read=True)
+    )(single)
+    assert torch.equal(slot_one.cache_read, shared_one.cache_read)
+    assert slot_one.slot_cache_read.shape == (1, 5, 1, 1, 2)
+    assert torch.equal(slot_one.slot_cache_read.squeeze(3), slot_one.cache_read)
+
+    widened = TinyFactors(
+        q=torch.cat(
+            (
+                single.q,
+                torch.flip(single.q, dims=(-1,)),
+                -single.q,
+                torch.roll(single.q, 1, dims=-1),
+            ),
+            dim=3,
+        ),
+        k=single.k,
+        v=single.v,
+        decay=single.decay,
+        beta_e=single.beta_e,
+        beta_w=single.beta_w,
+        out_mix=torch.tensor([0.1, 0.2, 0.3, 0.4]).view(1, 1, 1, 4).expand(1, 5, 1, 4),
+        valid=single.valid,
+        positions=single.positions,
+    )
+    slot_cell = TinyKMD2Cell(
+        _config(dv=2, r_out=4, cache=cache, per_slot_cache_read=True)
+    )
+    with torch.no_grad():
+        slot_cell.cache_amplitude.fill_(1.0)
+    output = slot_cell(widened)
+    assert output.slot_cache_read.shape == (1, 5, 1, 4, 2)
+    expected = (
+        output.slot_cache_read * widened.out_mix.unsqueeze(-1)
+    ).sum(dim=3)
+    assert torch.allclose(output.cache_read, expected, atol=0, rtol=0)
+    assert output.slot_attention_weights.shape[:4] == (1, 5, 1, 4)
+    assert torch.allclose(
+        output.slot_attention_weights.sum(dim=-1),
+        torch.ones(1, 5, 1, 4),
+    )
 
 
 def test_tiny_api_post_update_read_boundaries_valid_and_initial_state() -> None:
@@ -1053,6 +1390,26 @@ def test_tiny_disabled_identity_exact_cache_is_branch_local() -> None:
     assert cached.cache_persistent_bytes > 0
     assert cached.cache_block_bytes > 0
     assert torch.all((cached.sink_mass >= 0) & (cached.sink_mass <= 1))
+    assert cached.hit_ready_positions.shape == (1, 4, 1, 4)
+    assert cached.persistent_selected_positions.shape == (1, 4, 1, 2)
+    assert torch.equal(
+        cached.persistent_selected_positions[0, :2],
+        torch.full((2, 1, 2), -1, dtype=torch.int64),
+    )
+    assert torch.all(cached.persistent_selected_positions[0, 2:] >= 0)
+    assert cached.candidate_valid.shape == (1, 4, 1, 4)
+    assert cached.attention_weights.shape == (1, 4, 1, 5)
+    assert cached.top1_positions.shape == (1, 4, 1)
+    assert cached.attention_entropy.shape == (1, 4, 1)
+    assert cached.top1_mass.shape == (1, 4, 1)
+    assert torch.equal(
+        cached.hit_ready_positions >= 0, cached.candidate_valid
+    )
+    assert torch.allclose(
+        cached.attention_weights.sum(dim=-1), torch.ones(1, 4, 1)
+    )
+    assert cached.retention_count == 4
+    assert cached.eviction_count == 2
     assert torch.equal(
         cached.scores[0, :, 0],
         math.sqrt(2.0) * torch.tensor([1.0, 2.0, 3.0, 4.0]),
@@ -1183,15 +1540,24 @@ def test_tiny_active_effect_rotation_controls_have_finite_gradients(
     assert gradient.abs().item() > 1.0e-6
 
 
-def test_tiny_active_moving_frame_is_deferred_to_task9() -> None:
+def test_tiny_active_moving_frame_emits_phase_with_finite_gate_gradient() -> None:
     config = _config(rotation_mode="moving_frame", rotation_gate_init=0.0)
     projector = _projector(config, seed=201)
     hidden, valid, positions = _projector_inputs(config)
-    projector(hidden, valid, positions)
+    baseline = projector(hidden, valid, positions)
+    assert baseline.moving_frame_phase is not None
+    assert baseline.moving_frame_phase.count_nonzero() == 0
     with torch.no_grad():
-        projector.rotation_gate.fill_(torch.finfo(torch.float32).tiny)
-    with pytest.raises(NotImplementedError, match="moving.frame.*Task 9"):
-        projector(hidden, valid, positions)
+        projector.rotation_gate.fill_(0.7)
+    active = projector(hidden, valid, positions)
+    assert active.moving_frame_phase is not None
+    assert active.moving_frame_phase.count_nonzero() > 0
+    assert torch.equal(active.q, baseline.q)
+    assert torch.equal(active.k, baseline.k)
+    gradient = torch.autograd.grad(
+        active.moving_frame_phase.square().sum(), projector.rotation_gate
+    )[0]
+    assert torch.isfinite(gradient).all() and gradient.abs() > 0
 
 
 def test_tiny_active_effect_shared_query_slots_change_read() -> None:

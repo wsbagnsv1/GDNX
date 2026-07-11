@@ -290,6 +290,16 @@ class CacheBlockObservation:
     candidate_positions: torch.Tensor
     candidate_valid: torch.Tensor
     attention_weights: torch.Tensor
+    persistent_selected_positions: torch.Tensor
+    top1_positions: torch.Tensor
+    attention_entropy: torch.Tensor
+    top1_mass: torch.Tensor
+    sink_mass: torch.Tensor
+    update_scores: torch.Tensor
+    state_output_norm: torch.Tensor
+    cache_output_norm: torch.Tensor
+    persistent_bytes: int
+    block_bytes: int
 
 
 @dataclass(frozen=True)
@@ -301,6 +311,17 @@ class QwenExactCacheDiagnostics:
     cache_output_norm: torch.Tensor
     final_output_norm: torch.Tensor
     blocks: tuple[CompactCacheBlockDiagnostics, ...]
+    final_selected_positions: torch.Tensor
+    final_selected_scores: torch.Tensor
+    final_selected_valid: torch.Tensor
+    persistent_bytes: int
+
+
+@dataclass(frozen=True)
+class QwenBoundedCacheDiagnostics:
+    """Final-width state retained after synchronous streaming diagnostics."""
+
+    blocks_processed: int
     final_selected_positions: torch.Tensor
     final_selected_scores: torch.Tensor
     final_selected_valid: torch.Tensor
@@ -404,13 +425,19 @@ class KMD2ExactCacheAttn(KMD2NativeAttn):
         replacement.cache_config = cache_config
         replacement.last_cache_diagnostics = None
         replacement._cache_diagnostic_observer = None
+        replacement._retain_full_cache_diagnostics = True
         return replacement
 
-    def set_cache_diagnostic_observer(self, observer) -> None:
+    def set_cache_diagnostic_observer(
+        self, observer, *, retain_full: bool = True
+    ) -> None:
         """Set a synchronous ephemeral full-block observer, or disable it."""
         if observer is not None and not callable(observer):
             raise TypeError("cache diagnostic observer must be callable or None")
+        if type(retain_full) is not bool:
+            raise TypeError("retain_full must be a boolean")
         self._cache_diagnostic_observer = observer
+        self._retain_full_cache_diagnostics = True if observer is None else retain_full
 
     def _native_state_and_scores(
         self,
@@ -485,7 +512,9 @@ class KMD2ExactCacheAttn(KMD2NativeAttn):
 
         state = None
         cache_outputs: list[torch.Tensor] = []
+        retain_full = getattr(self, "_retain_full_cache_diagnostics", True)
         block_diagnostics: list[CompactCacheBlockDiagnostics] = []
+        blocks_processed = 0
         for block_start in range(0, steps, self.cache_config.block_size):
             block_stop = min(steps, block_start + self.cache_config.block_size)
             block_slice = slice(block_start, block_stop)
@@ -504,6 +533,7 @@ class KMD2ExactCacheAttn(KMD2NativeAttn):
                 sink_logit=self.cache_sink_logit,
             )
             cache_outputs.append(block_output)
+            blocks_processed += 1
             observer = self._cache_diagnostic_observer
             if observer is not None:
                 observer(
@@ -513,15 +543,32 @@ class KMD2ExactCacheAttn(KMD2NativeAttn):
                         candidate_positions=diagnostics.hit_ready_positions.detach(),
                         candidate_valid=diagnostics.candidate_valid.detach(),
                         attention_weights=diagnostics.attention_weights.detach(),
+                        persistent_selected_positions=(
+                            diagnostics.persistent_selected_positions.detach()
+                        ),
+                        top1_positions=diagnostics.top1_positions.detach(),
+                        attention_entropy=diagnostics.attention_entropy.detach(),
+                        top1_mass=diagnostics.top1_mass.detach(),
+                        sink_mass=diagnostics.sink_mass.detach(),
+                        update_scores=update_scores[:, block_slice].detach(),
+                        state_output_norm=torch.linalg.vector_norm(
+                            y_state[:, block_slice].float(), dim=-1
+                        ).detach(),
+                        cache_output_norm=torch.linalg.vector_norm(
+                            block_output.float(), dim=-1
+                        ).detach(),
+                        persistent_bytes=diagnostics.persistent_bytes,
+                        block_bytes=diagnostics.block_bytes,
                     )
                 )
-            block_diagnostics.append(
-                _compact_read_diagnostics(
-                    diagnostics,
-                    block_start=block_start,
-                    block_stop=block_stop,
+            if retain_full:
+                block_diagnostics.append(
+                    _compact_read_diagnostics(
+                        diagnostics,
+                        block_start=block_start,
+                        block_stop=block_stop,
+                    )
                 )
-            )
             state = merge_persistent_cache(
                 state=state,
                 block_k=k[:, block_slice],
@@ -538,23 +585,32 @@ class KMD2ExactCacheAttn(KMD2NativeAttn):
             self.cache_amplitude.view(1, 1, self.H, 1) * y_cache
         )
         assert state is not None
-        self.last_cache_diagnostics = QwenExactCacheDiagnostics(
-            update_scores=update_scores.detach().clone(),
-            state_output_norm=torch.linalg.vector_norm(
-                y_state.float(), dim=-1
-            ).detach(),
-            cache_output_norm=torch.linalg.vector_norm(
-                y_cache.float(), dim=-1
-            ).detach(),
-            final_output_norm=torch.linalg.vector_norm(
-                combined.float(), dim=-1
-            ).detach(),
-            blocks=tuple(block_diagnostics),
-            final_selected_positions=state.positions.detach().clone(),
-            final_selected_scores=state.scores.detach().clone(),
-            final_selected_valid=state.valid.detach().clone(),
-            persistent_bytes=state.nbytes,
-        )
+        if retain_full:
+            self.last_cache_diagnostics = QwenExactCacheDiagnostics(
+                update_scores=update_scores.detach().clone(),
+                state_output_norm=torch.linalg.vector_norm(
+                    y_state.float(), dim=-1
+                ).detach(),
+                cache_output_norm=torch.linalg.vector_norm(
+                    y_cache.float(), dim=-1
+                ).detach(),
+                final_output_norm=torch.linalg.vector_norm(
+                    combined.float(), dim=-1
+                ).detach(),
+                blocks=tuple(block_diagnostics),
+                final_selected_positions=state.positions.detach().clone(),
+                final_selected_scores=state.scores.detach().clone(),
+                final_selected_valid=state.valid.detach().clone(),
+                persistent_bytes=state.nbytes,
+            )
+        else:
+            self.last_cache_diagnostics = QwenBoundedCacheDiagnostics(
+                blocks_processed=blocks_processed,
+                final_selected_positions=state.positions.detach().clone(),
+                final_selected_scores=state.scores.detach().clone(),
+                final_selected_valid=state.valid.detach().clone(),
+                persistent_bytes=state.nbytes,
+            )
         return combined
 
 
@@ -1219,7 +1275,7 @@ def strict_load_cache_resume(
         if optimizer is not None:
             optimizer.load_state_dict(copy.deepcopy(optimizer_state))
             scheduler.load_state_dict(copy.deepcopy(scheduler_state))
-    except Exception:
+    except BaseException:
         with torch.no_grad():
             for name, parameter in named:
                 parameter.copy_(parameter_snapshots[name])
@@ -1269,6 +1325,7 @@ def load_native_then_install(
     *,
     expected_job_id: str | None = None,
     optimizer: torch.optim.Optimizer | None = None,
+    target_dtype: torch.dtype | None = None,
 ) -> tuple[int, ...]:
     """Apply native mode, load its checkpoint, then atomically install cache layers."""
     if not isinstance(cache_config, CacheConfig):
@@ -1278,6 +1335,11 @@ def load_native_then_install(
             "a pre-install optimizer cannot reference future cache parameters; "
             "use the two-phase build_cache_optimizer_and_resume helper after install"
         )
+    if target_dtype is not None and (
+        not isinstance(target_dtype, torch.dtype)
+        or not torch.empty((), dtype=target_dtype).is_floating_point()
+    ):
+        raise TypeError("target_dtype must be a floating-point torch dtype or None")
     prior_native_mode = os.environ.get("GDN3_KMD2_NATIVE")
     os.environ["GDN3_KMD2_NATIVE"] = "1"
     try:
@@ -1301,6 +1363,9 @@ def load_native_then_install(
                 )
             originals[index] = native
             prefixes[index] = _module_name(model, native) + "."
+        if target_dtype is not None:
+            for native in originals.values():
+                native.to(dtype=target_dtype)
 
         checkpoint_tensors = _checkpoint_tensor_mapping(native_checkpoint)
         model_state = model.state_dict()
@@ -1316,6 +1381,11 @@ def load_native_then_install(
                 raise ValueError(
                     f"native checkpoint shape mismatch for {name}: "
                     f"expected {tuple(target.shape)}, got {tuple(tensor.shape)}"
+                )
+            if tensor.dtype != target.dtype:
+                raise ValueError(
+                    f"native checkpoint dtype mismatch for {name}: "
+                    f"expected {target.dtype}, got {tensor.dtype}"
                 )
             if not bool(torch.isfinite(tensor.detach()).all()):
                 raise ValueError(f"native checkpoint tensor {name} is nonfinite")
@@ -1351,7 +1421,7 @@ def load_native_then_install(
                     expected_job_id,
                     optimizer=optimizer,
                 )
-        except Exception:
+        except BaseException:
             for index, native in originals.items():
                 layers[index].linear_attn = native
             with torch.no_grad():

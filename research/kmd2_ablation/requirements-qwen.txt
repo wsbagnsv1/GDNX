@@ -1,0 +1,4 @@
+torch>=2.4,<3
+transformers>=5.12.1,<6
+safetensors>=0.5,<1
+triton>=3.0,<4; platform_system == "Linux"

@@ -337,6 +337,17 @@ def test_exact_cache_state_requires_detached_scores() -> None:
         ExactCacheState(**tensors)
 
 
+def test_exact_cache_state_rejects_negative_positions_only_at_valid_slots() -> None:
+    tensors = _valid_state_tensors()
+    tensors["positions"][0, 0, 0] = -1
+    with pytest.raises(ValueError, match="positions.*nonnegative.*valid"):
+        ExactCacheState(**tensors)
+
+    tensors["valid"][0, 0, 0] = False
+    state = ExactCacheState(**tensors)
+    assert state.positions[0, 0, 0].item() == -1
+
+
 def test_exact_cache_state_rejects_nonfinite_scores_only_when_valid() -> None:
     tensors = _valid_state_tensors()
     tensors["scores"][0, 0, 0] = float("nan")
@@ -429,6 +440,28 @@ def test_merge_rejects_non_tensor_and_cross_device_block_inputs() -> None:
             width=2,
             storage_dtype=torch.float32,
         )
+
+
+def test_merge_rejects_negative_positions_only_at_valid_block_tokens() -> None:
+    inputs = _valid_block_inputs()
+    inputs[3] = inputs[3].clone()
+    inputs[3][0, 1] = -1
+    with pytest.raises(ValueError, match="block_positions.*nonnegative.*valid"):
+        merge_persistent_cache(
+            None,
+            *inputs,
+            width=2,
+            storage_dtype=torch.float32,
+        )
+
+    inputs[4][0, 1] = False
+    state = merge_persistent_cache(
+        None,
+        *inputs,
+        width=2,
+        storage_dtype=torch.float32,
+    )
+    assert not bool((state.positions[state.valid] < 0).any())
 
 
 @pytest.mark.parametrize(
@@ -1287,6 +1320,51 @@ def test_cache_read_rejects_current_block_positions_different_from_queries() -> 
 
     with pytest.raises(ValueError, match="block_positions.*query_positions"):
         exact_cache_module.cache_read_blocks(**kwargs)  # type: ignore[arg-type]
+
+
+def test_cache_read_rejects_negative_query_before_top1_sentinel_collision() -> None:
+    # Without sign validation this performs a real read while reporting top1=-1,
+    # which is indistinguishable from the learned-sink sentinel.
+    with pytest.raises(ValueError, match="query_positions.*nonnegative"):
+        exact_cache_module.cache_read_blocks(
+            q_eff=torch.ones(1, 1, 1, 1),
+            query_positions=torch.tensor([[-1]]),
+            state=None,
+            block_k=torch.ones(1, 1, 1, 1),
+            block_v=torch.full((1, 1, 1, 1), 5.0),
+            block_scores=torch.zeros(1, 1, 1),
+            block_positions=torch.tensor([[-1]]),
+            block_valid=torch.ones(1, 1, dtype=torch.bool),
+            config=_cache_config(),
+            gamma_q=torch.ones(1),
+            gamma_k=torch.ones(1),
+            sink_logit=torch.full((1,), -20.0),
+        )
+
+
+def test_cache_read_rejects_negative_position_at_valid_block_token() -> None:
+    kwargs = _valid_cache_read_kwargs()
+    kwargs["block_positions"] = kwargs["block_positions"].clone()  # type: ignore[union-attr]
+    kwargs["block_positions"][0, 1] = -1  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="block_positions.*nonnegative.*valid"):
+        exact_cache_module.cache_read_blocks(**kwargs)  # type: ignore[arg-type]
+
+
+def test_cache_read_allows_negative_one_only_at_invalid_block_token() -> None:
+    kwargs = _valid_cache_read_kwargs()
+    block_positions = kwargs["block_positions"].clone()  # type: ignore[union-attr]
+    block_valid = kwargs["block_valid"].clone()  # type: ignore[union-attr]
+    block_positions[:, 1] = -1
+    block_valid[:, 1] = False
+    kwargs["block_positions"] = block_positions
+    kwargs["block_valid"] = block_valid
+
+    output, diagnostics = exact_cache_module.cache_read_blocks(  # type: ignore[arg-type]
+        **kwargs
+    )
+    assert torch.isfinite(output).all()
+    assert not diagnostics.candidate_valid[..., 1].any()
 
 
 @pytest.mark.parametrize(

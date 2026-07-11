@@ -896,6 +896,62 @@ def test_synchronous_block_observer_exposes_detached_full_local_attention_once(
         exact.set_cache_diagnostic_observer(object())
 
 
+def test_bounded_streaming_observer_retains_only_final_width_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from research.kmd2_ablation.qwen_exact_cache import KMD2ExactCacheAttn
+
+    native = _native(monkeypatch, r_out=1)
+    cache_config = CacheConfig(
+        width=8,
+        block_size=8,
+        read="rmsnorm",
+        storage_dtype="fp32",
+    )
+    exact = KMD2ExactCacheAttn.from_native(native, _model_config(), cache_config)
+    observed_spans: list[tuple[int, int]] = []
+    max_ephemeral_elements = 0
+
+    def observer(block) -> None:
+        nonlocal max_ephemeral_elements
+        observed_spans.append((block.block_start, block.block_stop))
+        ephemeral = (
+            block.candidate_positions,
+            block.candidate_valid,
+            block.attention_weights,
+            block.persistent_selected_positions,
+            block.top1_positions,
+            block.attention_entropy,
+            block.top1_mass,
+            block.sink_mass,
+            block.update_scores,
+            block.state_output_norm,
+            block.cache_output_norm,
+        )
+        assert all(tensor.requires_grad is False for tensor in ephemeral)
+        max_ephemeral_elements = max(
+            max_ephemeral_elements,
+            sum(tensor.numel() for tensor in ephemeral),
+        )
+
+    exact.set_cache_diagnostic_observer(observer, retain_full=False)
+    exact._scan(*_scan_inputs(r_out=1, seed=5680, steps=65))
+    diagnostics = exact.last_cache_diagnostics
+
+    assert diagnostics is not None
+    assert observed_spans == [
+        (start, min(65, start + cache_config.block_size))
+        for start in range(0, 65, cache_config.block_size)
+    ]
+    assert diagnostics.blocks_processed == len(observed_spans)
+    assert not hasattr(diagnostics, "blocks")
+    assert not hasattr(diagnostics, "update_scores")
+    assert not hasattr(diagnostics, "state_output_norm")
+    assert not hasattr(diagnostics, "cache_output_norm")
+    assert _diagnostic_tensor_elements(diagnostics) == 3 * 2 * 2 * cache_config.width
+    assert max_ephemeral_elements > _diagnostic_tensor_elements(diagnostics)
+
+
 @pytest.mark.parametrize("mask_dtype", [torch.bool, torch.int64, torch.float32])
 def test_full_recompute_guard_accepts_only_exact_dense_call_contract(
     mask_dtype: torch.dtype,
@@ -1199,6 +1255,86 @@ def test_installer_orders_native_checkpoint_conversion_and_optional_resume_atomi
         model.model.layers[2].linear_attn.bw_off,
         checkpoint[_native_checkpoint_key(2, "bw_off")],
     )
+
+
+@pytest.mark.parametrize(
+    ("interruption_type", "interruption_value"),
+    [(KeyboardInterrupt, "resume interrupted"), (SystemExit, 73)],
+)
+def test_installer_base_exception_during_optional_resume_restores_native_layers_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+    interruption_type: type[BaseException],
+    interruption_value: object,
+) -> None:
+    import research.kmd2_ablation.qwen_exact_cache as qwen_cache
+
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "4")
+    monkeypatch.setenv("GDN3_KMD2_NATIVE", "pre-install-mode")
+    model = _FakeQwenModel(_model_config())
+    manager = _FakeNativeManager(model)
+    native_layers: dict[int, KMD2NativeAttn] = {}
+    original_apply = manager.apply_upgrade
+
+    def capture_native_layers() -> list[int]:
+        indices = original_apply()
+        native_layers.update(
+            {
+                index: model.model.layers[index].linear_attn
+                for index in indices
+            }
+        )
+        return indices
+
+    monkeypatch.setattr(manager, "apply_upgrade", capture_native_layers)
+    checkpoint = {
+        _native_checkpoint_key(0, "in_proj_qkv.weight"): torch.full(
+            (22, 12), 0.125
+        ),
+        _native_checkpoint_key(2, "bw_off"): torch.tensor([0.2, -0.1]),
+    }
+    interruption = interruption_type(interruption_value)
+    replacements: dict[int, qwen_cache.KMD2ExactCacheAttn] = {}
+
+    def interrupting_resume(
+        model_arg: torch.nn.Module,
+        _checkpoint: object,
+        _expected_job_id: str,
+        optimizer: torch.optim.Optimizer | None = None,
+    ) -> None:
+        assert model_arg is model
+        assert optimizer is None
+        for index in (0, 2):
+            replacement = model.model.layers[index].linear_attn
+            assert isinstance(replacement, qwen_cache.KMD2ExactCacheAttn)
+            replacements[index] = replacement
+        with torch.no_grad():
+            replacements[0].cache_amplitude.fill_(0.91)
+        raise interruption
+
+    monkeypatch.setattr(qwen_cache, "strict_load_cache_resume", interrupting_resume)
+    with pytest.raises(interruption_type) as caught:
+        qwen_cache.load_native_then_install(
+            model=model,
+            manager=manager,
+            model_config=_model_config(),
+            cache_config=_cache_config(),
+            native_checkpoint=checkpoint,
+            cache_resume={"opaque": "resume"},
+            expected_job_id="job-123",
+        )
+
+    assert caught.value is interruption
+    assert os.environ.get("GDN3_KMD2_NATIVE") == "pre-install-mode"
+    assert set(native_layers) == {0, 2}
+    assert set(replacements) == {0, 2}
+    for index in (0, 2):
+        assert model.model.layers[index].linear_attn is native_layers[index]
+        assert replacements[index] not in tuple(model.modules())
+    assert tuple(model.state_dict()) == tuple(manager.post_apply_tensors)
+    for name, expected in manager.post_apply_tensors.items():
+        torch.testing.assert_close(
+            model.state_dict()[name], expected, rtol=0.0, atol=0.0
+        )
 
 
 @pytest.mark.parametrize(
@@ -1769,6 +1905,80 @@ def test_scheduler_load_failure_rolls_back_model_optimizer_and_scheduler(
             optimizer=target_optimizer,
         )
 
+    assert attempts == 2
+    for name, parameter in named_cache_parameters(target_model):
+        torch.testing.assert_close(
+            parameter, parameter_snapshot[name], rtol=0.0, atol=0.0
+        )
+    _assert_nested_equal(target_optimizer.state_dict(), optimizer_snapshot)
+    _assert_nested_equal(target_scheduler.state_dict(), scheduler_snapshot)
+
+
+@pytest.mark.parametrize(
+    ("interruption_type", "interruption_value"),
+    [(KeyboardInterrupt, "scheduler interrupted"), (SystemExit, 91)],
+)
+def test_strict_resume_base_exception_rolls_back_model_optimizer_and_scheduler_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+    interruption_type: type[BaseException],
+    interruption_value: object,
+) -> None:
+    from research.kmd2_ablation.qwen_exact_cache import (
+        build_cache_resume,
+        named_cache_parameters,
+        strict_load_cache_resume,
+    )
+
+    source_model = _exact_cache_model(monkeypatch)
+    source_optimizer = _initialized_cache_optimizer(source_model, _cache_config())
+    resume = build_cache_resume(
+        source_model,
+        source_optimizer,
+        job_id="base-exception-rollback-job",
+    )
+    target_model = _exact_cache_model(monkeypatch)
+    target_optimizer = _initialized_cache_optimizer(target_model, _cache_config())
+    target_scheduler = target_optimizer._kmd2_shared_scheduler
+    target_scheduler.last_epoch = 7
+    with torch.no_grad():
+        for _, parameter in named_cache_parameters(target_model):
+            parameter.add_(0.05)
+        for state in target_optimizer.state.values():
+            state["exp_avg"].zero_()
+
+    parameter_snapshot = {
+        name: parameter.detach().clone()
+        for name, parameter in named_cache_parameters(target_model)
+    }
+    optimizer_snapshot = copy.deepcopy(target_optimizer.state_dict())
+    scheduler_snapshot = copy.deepcopy(target_scheduler.state_dict())
+    scheduler_type = type(target_scheduler)
+    original_load_state_dict = scheduler_type.load_state_dict
+    interruption = interruption_type(interruption_value)
+    attempts = 0
+
+    def interrupt_once(scheduler_self: object, state_dict: object) -> object:
+        nonlocal attempts
+        assert scheduler_self is target_scheduler
+        attempts += 1
+        if attempts == 1:
+            with torch.no_grad():
+                next(iter(named_cache_parameters(target_model)))[1].fill_(0.91)
+                next(iter(target_optimizer.state.values()))["exp_avg"].fill_(0.73)
+            target_scheduler.last_epoch = 999
+            raise interruption
+        return original_load_state_dict(scheduler_self, state_dict)
+
+    monkeypatch.setattr(scheduler_type, "load_state_dict", interrupt_once)
+    with pytest.raises(interruption_type) as caught:
+        strict_load_cache_resume(
+            target_model,
+            resume,
+            expected_job_id="base-exception-rollback-job",
+            optimizer=target_optimizer,
+        )
+
+    assert caught.value is interruption
     assert attempts == 2
     for name, parameter in named_cache_parameters(target_model):
         torch.testing.assert_close(
