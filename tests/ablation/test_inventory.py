@@ -15,16 +15,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 EXPECTED_SOURCE_SHA256 = {
     "gdn3/_reference_recurrence.py": (
-        "8e64611571904fb5e90ea7641e117f747c1089cee6231f401b571bd5a4b0888a"
+        "e700dd0ee9b4315dcadda93d7467d558370a21f29aa7c9b9411da0c82a69900a"
     ),
     "gdn3/gdn3_upgrade.py": (
-        "427ba5c5e03e48d76945ba465c53c6b7751443cec4187be88cb4acec8cb20666"
+        "952a617546b1673fc481601fea6ac10ce95dd9c014db4cae35eb39d93bd2d675"
     ),
     "gdn3/kmd2_fast_scan.py": (
-        "02f7ac667661362367456db7e4e128f7e82e29175d15777ac5b25a13b54d91da"
+        "5f6c83fb5afb869765d5599f2a726e5cfd93d939cd6e6fa4863b0fee2267a0b4"
     ),
     "gdn3/kmd2_native.py": (
-        "326b84cd8114b189496a385d084664d89ac73b3d98b1c720ce71d80af2069b67"
+        "30b820ddacab4a5632f054ab6ef97a46083c5ac74e15f4c1eb5bdf09a27dce68"
     ),
 }
 
@@ -86,6 +86,15 @@ EXPECTED_STRUCTURAL_FINDINGS = {
         "compiled_score_assignment": True,
     },
 }
+
+
+def test_repository_pins_python_and_shell_sources_to_lf():
+    attributes = (REPO_ROOT / ".gitattributes").read_text(
+        encoding="utf-8"
+    ).splitlines()
+
+    assert "*.py text eol=lf" in attributes
+    assert "*.sh text eol=lf" in attributes
 
 
 def _inventory_module():
