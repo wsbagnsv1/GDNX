@@ -21,7 +21,7 @@ from .exact_cache import (
 )
 
 
-TINY_BACKEND_SCHEMA_VERSION = "1.1.0"
+TINY_BACKEND_SCHEMA_VERSION = "1.2.0"
 _MAX_UNBOUNDED_CACHE_TOKENS = 131_072
 _MAX_CACHE_DIAGNOSTIC_BYTES = 512 * 1024 * 1024
 # Retain the previous private tuning hook while applying the budget to every cache.
@@ -253,6 +253,8 @@ def true_mimo_update(
         raise ValueError("true-MIMO operands must contain only finite values")
     if bool((beta_e.detach() < 0).any()):
         raise ValueError("true-MIMO beta_e must be nonnegative")
+    if bool((beta_w.detach() < 0).any()):
+        raise ValueError("true-MIMO beta_w must be nonnegative")
     if state_bar.ndim != 4 or key.ndim != 4 or value.ndim != 4:
         raise ValueError("true-MIMO state/key/value ranks are invalid")
     batch, heads, key_dim, value_dim = state_bar.shape
@@ -261,16 +263,38 @@ def true_mimo_update(
     rank = key.shape[2]
     if rank < 1 or value.shape != (batch, heads, rank, value_dim):
         raise ValueError("true-MIMO value must have shape [B,H,R,dv]")
-    if beta_e.shape != (batch, heads, rank) or beta_w.shape != (batch, heads, rank):
-        raise ValueError("true-MIMO gates must have shape [B,H,R]")
+    scalar_shapes = (
+        beta_e.shape == (batch, heads, rank)
+        and beta_w.shape == (batch, heads, rank)
+    )
+    channel_shapes = (
+        beta_e.shape == (batch, heads, rank, key_dim)
+        and beta_w.shape == (batch, heads, rank, value_dim)
+    )
+    if not (scalar_shapes or channel_shapes):
+        raise ValueError(
+            "true-MIMO gates must both be scalar [B,H,R] or channelwise "
+            "beta_e=[B,H,R,dk], beta_w=[B,H,R,dv]"
+        )
+    if channel_shapes and rank != 1:
+        raise ValueError(
+            "channelwise Gated DeltaNet-2 gates currently require rank R=1"
+        )
     if rank == 1:
         key_one = key[:, :, 0]
         value_one = value[:, :, 0]
-        memory = torch.matmul(key_one.unsqueeze(-2), state_bar).squeeze(-2)
-        update = (
-            beta_w[:, :, 0].unsqueeze(-1) * value_one
-            - beta_e[:, :, 0].unsqueeze(-1) * memory
-        )
+        if channel_shapes:
+            erase_direction = beta_e[:, :, 0] * key_one
+            memory = torch.matmul(
+                erase_direction.unsqueeze(-2), state_bar
+            ).squeeze(-2)
+            update = beta_w[:, :, 0] * value_one - memory
+        else:
+            memory = torch.matmul(key_one.unsqueeze(-2), state_bar).squeeze(-2)
+            update = (
+                beta_w[:, :, 0].unsqueeze(-1) * value_one
+                - beta_e[:, :, 0].unsqueeze(-1) * memory
+            )
         return state_bar + key_one.unsqueeze(-1) * update.unsqueeze(-2)
     memory = torch.matmul(key, state_bar)
     erase = torch.einsum(
@@ -434,6 +458,7 @@ class TinyKMD2Config:
     selector_seed: int = 0
     unbounded_cache: bool = False
     per_slot_cache_read: bool = False
+    gdn2_decoupled: bool = False
 
     def __post_init__(self) -> None:
         for name in (
@@ -479,6 +504,8 @@ class TinyKMD2Config:
             object.__setattr__(self, name, float(getattr(self, name)))
         if type(self.trapezoid) is not bool:
             raise TypeError("trapezoid must be a bool")
+        if type(self.gdn2_decoupled) is not bool:
+            raise TypeError("gdn2_decoupled must be a bool")
         if type(self.corrected_momentum) is not bool:
             raise TypeError("corrected_momentum must be a bool")
         if type(self.causal_lookahead) is not bool:
@@ -518,6 +545,18 @@ class TinyKMD2Config:
                 )
             if self.cache is not None:
                 raise ValueError("constant-coordinate oracle cannot be combined with cache")
+        if self.gdn2_decoupled:
+            if self.mimo_rank != 1:
+                raise ValueError("Gated DeltaNet-2 gates currently require mimo_rank=1")
+            if self.bc_bias_mode == "constant_coordinate_oracle":
+                raise ValueError(
+                    "Gated DeltaNet-2 gates cannot be combined with the "
+                    "constant-coordinate oracle"
+                )
+            if self.cache is not None:
+                raise ValueError(
+                    "Gated DeltaNet-2 gates are not yet defined for exact-cache scoring"
+                )
         if self.corrected_momentum and self.trapezoid:
             raise ValueError("corrected_momentum and trapezoid cannot be combined")
         object.__setattr__(self, "eps", float(self.eps))
@@ -650,14 +689,27 @@ class TinyFactors:
             raise ValueError("v value dimension must be positive")
         expected_shapes = {
             "decay": (batch, steps, heads, key_dim),
-            "beta_e": (batch, steps, heads, write_slots),
-            "beta_w": (batch, steps, heads, write_slots),
             "valid": (batch, steps),
             "positions": (batch, steps),
         }
         for name, shape in expected_shapes.items():
             if tuple(getattr(self, name).shape) != shape:
                 raise ValueError(f"{name} must have shape {shape}")
+        scalar_gates = (
+            self.beta_e.shape == (batch, steps, heads, write_slots)
+            and self.beta_w.shape == (batch, steps, heads, write_slots)
+        )
+        channel_gates = (
+            self.beta_e.shape
+            == (batch, steps, heads, write_slots, key_dim)
+            and self.beta_w.shape
+            == (batch, steps, heads, write_slots, value_dim)
+        )
+        if not (scalar_gates or channel_gates):
+            raise ValueError(
+                "beta_e/beta_w must both be scalar [B,T,H,R] or channelwise "
+                "beta_e=[B,T,H,R,dk], beta_w=[B,T,H,R,dv]"
+            )
         valid_out_mix_shapes = {
             (batch, steps, heads, q_slots),
             (batch, steps, heads, q_slots, value_dim),
@@ -873,6 +925,10 @@ class TinyKMD2Cell(nn.Module):
             raise ValueError(
                 "true-MIMO factors require channelwise output mixing and rankwise gates"
             )
+        channel_gates = factors.beta_e.ndim == 5
+        if self.config.gdn2_decoupled != channel_gates:
+            expected = "channelwise" if self.config.gdn2_decoupled else "scalar"
+            raise ValueError(f"config requires {expected} erase/write gates")
         if self.config.trapezoid and factors.trapezoid_rho is None:
             raise ValueError("trapezoid factors require trapezoid_rho")
         if not self.config.trapezoid and factors.trapezoid_rho is not None:
@@ -1094,10 +1150,9 @@ class TinyKMD2Cell(nn.Module):
             if write_slots == 1:
                 key_one = key[:, :, 0]
                 value_one = value[:, :, 0]
-                cache_memory = torch.matmul(
+                raw_memory = torch.matmul(
                     key_one.unsqueeze(-2), state_bar
                 ).squeeze(-2)
-                cache_memories.append(cache_memory)
                 value_target = value_one
                 if lookahead_rho is not None:
                     assert previous_value is not None
@@ -1123,11 +1178,26 @@ class TinyKMD2Cell(nn.Module):
                     gamma = momentum_gamma[:, token]
                     velocity_bar = decay[:, token].unsqueeze(-1) * velocity
                     state_look = state_bar + gamma[:, :, None, None] * velocity_bar
-                memory = torch.matmul(key_one.unsqueeze(-2), state_look).squeeze(-2)
-                update = (
-                    beta_w[:, token, :, 0].unsqueeze(-1) * value_target
-                    - beta_e[:, token, :, 0].unsqueeze(-1) * memory
-                )
+                if self.config.gdn2_decoupled:
+                    erase_direction = beta_e[:, token, :, 0] * key_one
+                    memory = torch.matmul(
+                        erase_direction.unsqueeze(-2), state_look
+                    ).squeeze(-2)
+                    current_write_value = beta_w[:, token, :, 0] * value_target
+                    update = current_write_value - memory
+                    cache_memories.append(memory)
+                else:
+                    memory = torch.matmul(
+                        key_one.unsqueeze(-2), state_look
+                    ).squeeze(-2)
+                    current_write_value = (
+                        beta_w[:, token, :, 0].unsqueeze(-1) * value_target
+                    )
+                    update = (
+                        current_write_value
+                        - beta_e[:, token, :, 0].unsqueeze(-1) * memory
+                    )
+                    cache_memories.append(raw_memory)
                 native_outer = key_one.unsqueeze(-1) * update.unsqueeze(-2)
                 velocity_candidate = None
                 if gamma is None:
@@ -1143,9 +1213,6 @@ class TinyKMD2Cell(nn.Module):
                 ) * torch.linalg.vector_norm(update, dim=-1)
                 if trapezoid_rho is not None:
                     assert previous_key is not None and previous_write is not None
-                    current_write_value = (
-                        beta_w[:, token, :, 0].unsqueeze(-1) * value_target
-                    )
                     current_write_outer = (
                         key_one.unsqueeze(-1) * current_write_value.unsqueeze(-2)
                     )
@@ -1763,7 +1830,15 @@ class TinyFactorProjector(nn.Module):
         self.v_proj = nn.Linear(config.d_model, h * dv, bias=False)
         self.z_proj = nn.Linear(config.d_model, h * dv, bias=False)
         self.a_proj = nn.Linear(config.d_model, h, bias=False)
-        self.b_proj = nn.Linear(config.d_model, h * rank, bias=False)
+        if config.gdn2_decoupled:
+            self.erase_proj = nn.Linear(
+                config.d_model, h * rank * factor_dk, bias=False
+            )
+            self.write_proj = nn.Linear(
+                config.d_model, h * rank * dv, bias=False
+            )
+        else:
+            self.b_proj = nn.Linear(config.d_model, h * rank, bias=False)
         mixed_dim = h * (2 * rank * factor_dk + dv)
         self.conv = nn.Conv1d(
             mixed_dim,
@@ -1778,9 +1853,10 @@ class TinyFactorProjector(nn.Module):
         self.channel_decay_gate = nn.Parameter(
             torch.tensor(config.channel_decay_gate_init)
         )
-        self.write_offset_gate = nn.Parameter(
-            torch.tensor(config.write_offset_gate_init)
-        )
+        if not config.gdn2_decoupled:
+            self.write_offset_gate = nn.Parameter(
+                torch.tensor(config.write_offset_gate_init)
+            )
         if config.trapezoid:
             self.rho_head = nn.Parameter(
                 torch.full((h,), config.trapezoid_gate_init, dtype=torch.float32)
@@ -1798,7 +1874,8 @@ class TinyFactorProjector(nn.Module):
         self.A_log = nn.Parameter(torch.zeros(h))
         self.dt_bias = nn.Parameter(torch.ones(h))
         self.decay_chan = nn.Parameter(torch.zeros(h, factor_dk))
-        self.bw_off = nn.Parameter(torch.zeros(h, rank))
+        if not config.gdn2_decoupled:
+            self.bw_off = nn.Parameter(torch.zeros(h, rank))
         if rank == 1:
             q_slots = config.r_out
             self.q_slot_scale = nn.Parameter(torch.zeros(h, q_slots, factor_dk))
@@ -1955,7 +2032,6 @@ class TinyFactorProjector(nn.Module):
                 k = self._rope(k, theta.cos().unsqueeze(-2), theta.sin().unsqueeze(-2))
 
         a = self.a_proj(hidden).float().view(batch, steps, h)
-        b = self.b_proj(hidden).float().view(batch, steps, h, rank)
         g_head = -self.A_log.float().exp() * F.softplus(a + self.dt_bias.float())
         decay = (
             g_head.unsqueeze(-1)
@@ -1964,10 +2040,21 @@ class TinyFactorProjector(nn.Module):
         if c.bc_bias_mode == "constant_coordinate_oracle":
             constant_decay = g_head.exp().clamp(max=1.0).unsqueeze(-1)
             decay = torch.cat((decay, constant_decay), dim=-1)
-        beta_e = torch.sigmoid(b)
-        beta_w = torch.sigmoid(
-            b + self.write_offset_gate * self.bw_off.float()[None, None]
-        )
+        if c.gdn2_decoupled:
+            erase_logits = self.erase_proj(hidden).float().view(
+                batch, steps, h, rank, factor_dk
+            )
+            write_logits = self.write_proj(hidden).float().view(
+                batch, steps, h, rank, dv
+            )
+            beta_e = torch.sigmoid(erase_logits)
+            beta_w = torch.sigmoid(write_logits)
+        else:
+            b = self.b_proj(hidden).float().view(batch, steps, h, rank)
+            beta_e = torch.sigmoid(b)
+            beta_w = torch.sigmoid(
+                b + self.write_offset_gate * self.bw_off.float()[None, None]
+            )
         trapezoid_rho = None
         if c.trapezoid:
             trapezoid_rho = self.rho_head.float()[None, None] * torch.sigmoid(

@@ -26,6 +26,7 @@ DECLARED_ARM_IDS = {
     "causal_lookahead",
     "state_size.sweep",
     "true_mimo.sweep",
+    "gdn2_decoupled.channelwise",
     "exact_cache.off",
     "exact_cache.current_block_only",
     "exact_cache.selector.exact_outer",
@@ -184,10 +185,18 @@ def test_registry_keeps_qwen_incompatible_redesigns_tiny_only() -> None:
 
     state_size = get_variant("state_size.sweep")
     true_mimo = get_variant("true_mimo.sweep")
+    gdn2_decoupled = get_variant("gdn2_decoupled.channelwise")
     assert state_size.compatible_backends == frozenset({"tiny"})
     assert true_mimo.compatible_backends == frozenset({"tiny"})
+    assert gdn2_decoupled.compatible_backends == frozenset({"tiny"})
     assert state_size.experiment_kind == true_mimo.experiment_kind == "cold_redesign"
     assert state_size.native_warm_start is true_mimo.native_warm_start is False
+    assert gdn2_decoupled.experiment_kind == "cold_redesign"
+    assert gdn2_decoupled.native_warm_start is False
+    assert gdn2_decoupled.changed_parameters == (
+        "erase_proj.weight",
+        "write_proj.weight",
+    )
     assert get_variant("rotation.moving_frame_oracle").compatible_backends == frozenset(
         {"tiny"}
     )

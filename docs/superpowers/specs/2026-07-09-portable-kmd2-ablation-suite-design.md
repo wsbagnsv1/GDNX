@@ -67,7 +67,7 @@ The suite must inventory the current implementation before creating jobs.
 | Rotation | Cumulative data-dependent paired q/k rotation |
 | Output slots | `r_out=4` scaled copies of a shared query plus learned mixing |
 | Decay | Native per-head decay plus learned per-key-channel offsets |
-| Write control | Per-head write-beta offset decoupled from erase |
+| Write control | Shared token logit plus a static per-head write offset; not independently token-controlled |
 | Recurrent state | Dense `dk x dv` state, zeroed on every forward call |
 
 ### Features not currently present
@@ -77,6 +77,7 @@ The suite must inventory the current implementation before creating jobs.
 | Trapezoidal state-input carry | Previous and current write factors blended inside the recurrence |
 | B/C-style bias | New gated q/k channel biases after normalization |
 | True MIMO | Independent rank-R write inputs and output queries sharing one state |
+| Gated DeltaNet-2 gates | Independent token-conditioned key-channel erase and value-channel write projections |
 | Momentum | A second full velocity state with a coherent lookahead update |
 | Lookahead target | A causal, identity-gated value-space derivative correction |
 | Native state-size knob | A changed native state shape; not warm-load compatible |
@@ -88,6 +89,29 @@ architectures. They are not valid substitutes for the native baseline.
 inventory records that conceptual overlap. It is inactive when native KMD-2 is
 selected, position/recency based, read linearly as part of state, and compacted
 lossily; it is not the proposed top-surprise, sharply read cache.
+
+### Gated DeltaNet-2 erase/write ablation
+
+The native scalar-offset control remains unchanged. The tiny-only
+`gdn2_decoupled.channelwise` arm implements the Gated DeltaNet-2 recurrence
+with independent token projections:
+
+```text
+b_t = sigmoid(W_b x_t) in [0,1]^dk
+w_t = sigmoid(W_w x_t) in [0,1]^dv
+S_bar = D_t * S_prev
+e_t = b_t * k_t
+z_t = w_t * v_t
+r_t = S_bar^T e_t
+S_t = S_bar + k_t (z_t - r_t)^T
+```
+
+The left outer-product address remains `k_t`; only the erase/read direction is
+gated as `b_t * k_t`. This is deliberately not implemented as two scalar
+logits. Broadcasting scalar `beta_e` and `beta_w` across their respective
+channels recovers the prior delta-rule update exactly. The initial arm is a
+cold redesign at `mimo_rank=1`; exact-cache scoring and a fused scan are out of
+scope until their gate-aware definitions and parity tests are added.
 
 ## Redundancy and No-Op Gates
 

@@ -574,7 +574,9 @@ git commit -m "feat: add deterministic KMD-2 tasks"
 The explicit `TinyKMD2Config` constructor declares `d_model`, `heads`, `dk`,
 `dv`, `layers`, `vocab_size`, `r_out`, `mimo_rank`, mechanism gates and dtype.
 `TinyFactors` holds `q[B,T,H,Q,dk]`, `k[B,T,H,R,dk]`,
-`v[B,T,H,R,dv]`, `decay[B,T,H,dk]`, `beta_e/beta_w[B,T,H,R]`,
+`v[B,T,H,R,dv]`, `decay[B,T,H,dk]`, scalar
+`beta_e/beta_w[B,T,H,R]`, or the Gated DeltaNet-2 alternative
+`beta_e[B,T,H,R,dk]` and `beta_w[B,T,H,R,dv]`,
 `out_mix[B,T,H,Q]` for the native/shared-query path or channelwise
 `out_mix[B,T,H,R,dv]` plus `read_gate[B,T,H,R,dv]` for true MIMO,
 `valid[B,T]`, and `positions[B,T]`. Native shared-query mode has
